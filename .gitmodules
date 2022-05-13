@@ -1,3 +1,9 @@
 [submodule "themes/hugo-geekdoc"]
 	path = themes/hugo-geekdoc
 	url = https://gitee.com/ayalastrike/hugo-geekdoc.git
+[submodule "public"]
+	path = public
+	url = git@github.com:ayalastrike/ayalastrike.github.io.git
+[submodule "themes/hugo-book"]
+	path = themes/hugo-book
+	url = https://github.com/alex-shpak/hugo-book
