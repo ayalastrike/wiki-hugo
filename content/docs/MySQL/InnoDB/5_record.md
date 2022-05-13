@@ -80,5 +80,3 @@ InnoDB存储引擎中的表使用的是索引组织表（**I**ndex **O**rganized
 ### 2.1.1 sdfs
 
 sdfs
-
-![ut0lst](/ut0lst.png)

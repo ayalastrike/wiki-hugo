@@ -13,6 +13,10 @@ enableGitInfo = true
 
 [markup.tableOfContents]
 startLevel = 1
+endLevel = 6
+
+[markup.highlight]
+  style = 'rrt'
 
 [menu]
 # [[menu.before]]
