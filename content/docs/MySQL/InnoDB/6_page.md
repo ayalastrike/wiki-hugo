@@ -39,7 +39,7 @@ static MYSQL_SYSVAR_ULONG(page_size, srv_page_size,
 
 # page layout
 
-在InnoDB中，页根据用途分为多种类型。而使用最多的就是索引页，所以在这里我们focs在index page。
+在InnoDB中，页根据用途分为多种类型。而使用最多的就是索引页，所以在这里我们focus在index page。
 
 索引页（index page）的页面布局如下：
 
@@ -388,3 +388,97 @@ page_cur_insert_rec_low用来插入记录，记录可以是物理记录或者逻
 具体流程如下：
 
 ![InnoDB_page_record_insert](/InnoDB_page_record_insert.png)
+
+page_cur_insert_rec_low
+
+1. 获得物理记录的长度
+2. 获取空闲空间，从碎片区或者从空闲区（heap）分配
+3. 将物理记录拷贝到空闲空间
+4. 修改记录的双向链表前后指针，和page header中的PAGE_N_RECS
+5. 设置record header（n_owned = 0, heap_no）
+6. 更新page header（PAGE_LAST_INSERT、PAGE_DIRECTION、PAGE_N_DIRECTION）
+7. 更新slot的n_owned
+8. 如果需要，分裂slot
+9. 写redo log
+
+插入记录会对页进行修改，所以要产生redo log，redo log的类型是MTR_LOG_INSERT，在每次调用page_cur_insert_rec_low的同时，调用page_cur_insert_rec_write_log将变更写入redo log。MTR_LOG_INSERT的redo log日志格式如图所示：
+
+| 字段                  | 说明                                                         |
+| --------------------- | ------------------------------------------------------------ |
+| type                  | MTR_LOG_INSERT                                               |
+| space                 | 记录插入到的表空间ID                                         |
+| page no               | 记录插入的索引页在表空间中的偏移量                           |
+| cur_rec_offset        | 插入前，page cursor指向的行记录在页中的偏移量                |
+| lex & extra_info_flag | 保存redo log body长度和记录的extra_info_flag                 |
+| info_bits             | extra_info_flag=1时，保存插入记录的info_bits                 |
+| original_offset       | extra_info_flag=1时，保存插入记录的original offset           |
+| mis_match_index       | extra_info_flag=1时，保存插入记录与cur_rec_offset所指向记录的第一个不同的字节（record header不用比较） |
+| original rec body     | 插入记录的body                                               |
+
+MTR_LOG_INSERTS格式说明：
+
+![InnoDB_redo_log_MLOG_REC_INSERT](/InnoDB_redo_log_MLOG_REC_INSERT.png)
+
+简单来看，MTR_LOG_INSERTS重做日志就是cursor定位的记录偏移量+插入的记录。为了使redo log尽可能的小（性能），对插入的记录进行优化，比较插入的记录和cursor定位的记录，找出第一个不同的字节位置。这里不需要对record header进行比较，因为record header是在记录插入完成后再进行初始化的。cursor定位的物理记录如图所示：
+
+![InnoDB_redo_log_MLOG_REC_INSERT_example](/InnoDB_redo_log_MLOG_REC_INSERT_example.png)
+
+上述的例子中cursor定位的记录为（1，'aaa'），那么当要插入的记录为（2，'bbb'）时，可以进行压缩。由于插入记录的长度与之前cursor定位的记录长度相同，因此不需要保存到重做日志。此外，列row id的前三个字节也都相同，都是80 00 00，因此同样不需要保存。故重做日志仅需保存插入记录的第13个字节之后（4+6+3）开始的内容。
+
+在重做日志中，extra_info_flag为1的判断依据为cursor定位的记录与插入记录的info_bits、extra_size、记录大小是否相等。其在源码中为：
+
+````c++
+
+if ((rec_get_info_bits(insert_rec) != rec_get_info_bits(cursor_rec))
+   || (extra_size != cur_extra_size)
+   || (rec_size != cur_rec_size)) {
+   extra_info_yes = 1;
+} else {
+   extra_info_yes = 0;
+}
+````
+
+记录插入通常是将逻辑记录插入到页中，但在函数page_copy_rec_list_*中，插入的记录是物理记录。这是因为这些操作是对页中已存在的记录进行"整理"。而在函数page_copy_rec_list_中将物理记录插入的重做日志定义为MTR_LOG_SHORT_INSERTS。这可以理解为一种较为“快速”的插入。其和MTR_LOG _INSERT不同之处在于不需要在重做日志中保存cursor指向记录的偏移量，因为这是将页中的所有记录插入到新页中的。
+
+在记录插入完成后，需要对page directory进行维护，看是否需要对槽进行平衡操作。
+
+## 删除记录
+
+page_cur_delete_rec将cursor所指向的物理记录进行"彻底"地删除，而并不是将记录的delete flag设置为1。具体流程如下
+
+1. 记日志
+2. PAGE_LAST_INSERT置空
+3. 找到前后记录
+4. 更新记录双向链表
+5. 更新page directory
+6. 更新n_owned
+7. 释放记录（PAGE_FREE+，PAGE_GARBAGE+，PAGE_N_RECS-）
+8. 如果slot的n_owned小于4，balance slot
+
+相对于插入，删除记录的重做日志就显得简单多了，其只需额外地记录删除记录在页中的偏移量即可。重做日志的结构如图所示：
+
+![InnoDB_redo_log_MLOG_REC_DELETE](/InnoDB_redo_log_MLOG_REC_DELETE.png)
+
+## 并发控制
+
+对于索引页的并发控制是在上层的调用中进行的，主要集中在btr模块中。在InnoDB中，btr模块负责对于B+树索引的控制，其中需要涉及索引页的并发控制以及锁信息的管理。
+
+page模块是对索引页进行操作的最底层函数。InnoDB本身不直接调用该模块中的函数。而且page模块操作页的数据结构为page_t，也就是字节。因此在该模块中并不涉及并发的控制，在源码中也看不到任何对于索引页加s-latch或者x-latch的过程。函数page_copy_rec_list_*中有需要对页上的锁信息进行更新，但这并不是对页进行并发保护。
+
+## 页面重组
+
+我们知道，对于数据的插入，InnoDB只检查碎片链表的第一个可重用空间。另外，如果频繁的插入删除记录，则会加大碎片的产生，最终可能所有的碎片区空间加起来可以存储很多数据，但却无法将其使用起来。
+
+页面的碎片过多，会造成以下问题：
+
+- 页面比较多，但实际用于索引的数据较少
+- 大量的碎片导致需要读取更多的页面，产生大量的无效IO
+- 数据库整体性能变差
+
+页面重组（re-organize）的功能，即在页空间不足时会首先对页进行重新组织（btr_page_reorganize_low），按照页中的记录主键顺序重新整理，回收碎片空间，详细流程如下：
+
+1. 新建一个page
+2. 将碎片页面的数据一条一条的插入到新的page
+3. 将旧页面释放
+
+这样新页面中的所有数据都是连续插入进去的，空间完全没有浪费，最后一条记录后面的剩余空间（可用空间）都在PAGE_HEAP_TOP下管理。
