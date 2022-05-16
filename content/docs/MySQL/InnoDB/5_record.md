@@ -706,7 +706,9 @@ rec_convert_dtuple_to_rec_comp(
 - 当前记录的总字节数 > 空白页可用空间的一半 > 1/2 * page_get_free_space_of_empty()，即8132字节
 - 列大于整页（REC_MAX_DATA_SIZE），即16384字节
 
-可以发现，只要满足第一个条件即可。因此在进行插入操作时将大记录中的off-page column的部分数据存放到溢出页中，直到记录占用的字节数小于一半页的大小（8132字节），这种列的属性为extern，在column offset列的偏移量列表中通过REC_2BYTE_EXTERN_MASK标记。![InnoDB_physical_record_overflow_page_and_off-page_column](/InnoDB_physical_record_overflow_page_and_off-page_column.png)
+可以发现，只要满足第一个条件即可。因此在进行插入操作时将大记录中的off-page column的部分数据存放到溢出页中，直到记录占用的字节数小于一半页的大小（8132字节），这种列的属性为extern，在column offset列的偏移量列表中通过REC_2BYTE_EXTERN_MASK标记。
+
+![InnoDB_physical_record_overflow_page_and_off-page_column](/InnoDB_physical_record_overflow_page_and_off-page_column.png)
 
 {{< hint info>}}
 
