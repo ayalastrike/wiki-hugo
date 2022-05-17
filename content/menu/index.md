@@ -28,4 +28,5 @@ headless: false
         - [record]({{< relref "/docs/MySQL/InnoDB/5_record.md" >}})
         - [page]({{< relref "/docs/MySQL/InnoDB/6_page.md" >}})
         - [storage]({{< relref "/docs/MySQL/InnoDB/7_storage.md" >}})
+        - [buffer pool]({{< relref "/docs/MySQL/InnoDB/8_buffer_pool.md" >}})
 
