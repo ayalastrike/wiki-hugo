@@ -1,3 +1,5 @@
+（转载自阿里内核月报）
+
 # 背景
 
 MySQL对于statement执行结果报文通常分为两类：Resultset和OK/ERR，针对 DML语句则返回OK/ERR报文，其中包括几个影响记录，扫描记录等属性。但在很多业务场景下，通常 INSERT/UPDATE/DELETE 这样的DML语句后，都会跟随SELECT查询当前记录内容，以进行接下来的业务处理， 为了减少一次 Client <-> DB Server 交互，类似 PostgreSQL / Oracle 都提供了 returning clause 支持 DML 返回 Resultset。

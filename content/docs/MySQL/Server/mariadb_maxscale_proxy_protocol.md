@@ -1,3 +1,5 @@
+（转载自阿里内核月报）
+
 MariaDB MaxScale 是一款数据库中间件，可以按照语义分发语句到多个数据库服务器上。它对应用程序透明，可以提供读写分离、负载均衡和高可用服务。
 
 proxy protocol 是 MaxScale 引入，为了解决使用proxy作为中间件连接mysql时，mysql获取client ip用 client通过proxy中间价连接mysql时，mysql server接收到认证报文中，包含的是proxy节点的IP。如果mysql.user表中指定了client的IP，无法通过认证。
