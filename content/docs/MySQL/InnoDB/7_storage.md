@@ -719,3 +719,203 @@ Percona
 另外，page size的大小设置也和存储设备的IO性能息息相关，存储设备慢，page size可以设的大一些，以保证IO操作可以读取到更多的数据。
 
 页是InnoDB访问磁盘的最小I/O单元。页的默认大小是16K（UNIV_PAGE_SIZE）。除去页头和页尾的元数据，页的绝大部分空间用来存储数据，页的结构如图所示：
+
+![InnoDB_storage_page_layout](/InnoDB_storage_page_layout.png)
+
+从上图中可以看到，页有不同的类型，但都有统一固定的头部（page header 38 bytes）和尾部（page trailer 8 bytes）。通过space_id + page_offset可以定位页的具体位置（FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID + FIL_PAGE_OFFSET）。由于FIL_PAGE_OFFSET的长度是4个字节，所以一个表空间的最大存储空间是64TB（231*2*16K）。索引页之间的逻辑顺序（需要保证有序性：键值顺序）通过双向链表指针连接起来（FIL_PAGE_PREV、FIL_PAGE_NEXT），即内部存储的是前页/后页在表空间中的偏移量。
+
+{{< hint info >}}
+
+页的位置和页之间的位置都通过offset来存储，即相对位置存储的好处是，当表空间数据移动时不会受到影响，如果存储的是绝对位置，则需要进行变更。
+
+{{</hint>}}
+
+FIL_HEADER和FIL_TRAIL的字段如下：
+
+|                                  | 字段                        | 大小                                                         | 说明                                                         |
+| :------------------------------- | :-------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- |
+| FIL_PAGE_DATA（38）              | FIL_PAGE_SPACE_OR_CHKSUM    | 4                                                            | checksum                                                     |
+| FIL_PAGE_OFFSET                  | 4                           | 页号，也是页在表空间中的偏移量                               |                                                              |
+| FIL_PAGE_PREV                    | 4                           | 前一个页的偏移量（仅对索引页有效）                           |                                                              |
+| FIL_PAGE_NEXT                    | 4                           | 后一个页的偏移量（仅对索引页有效）                           |                                                              |
+| FIL_PAGE_LSN                     | 8                           | 页LSN                                                        |                                                              |
+| FIL_PAGE_TYPE                    | 2                           | 页类型                                                       |                                                              |
+| FIL_PAGE_FILE_FLUSH_LSN          | 8                           | 仅在系统表空间的第1个页（0,0）中使用，用来判断数据库是否正常关闭 |                                                              |
+| FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID | 8                           | 表空间ID（缓冲池中靠space_id+page_no来标识页）               |                                                              |
+| FIL_PAGE_DATA_END（8）           | FIL_PAGE_END_LSN_OLD_CHKSUM | 8                                                            | 前4个字节存放checksum，后4个字节存放FIL_PAGE_LSN的后4个字节，用于检测页是否损坏 |
+
+{{< hint warning>}}
+
+在数据库正常关闭时，会做一次checkpoint，并把CP lsn写入到页（0,0）中。这样，在数据库恢复时，根据这两个值是否相等来判断是否为正常关闭。
+
+{{</hint>}}
+
+{{< hint warning>}}
+
+**判断页面是否损坏**
+
+通过FIL_PAGE_END_LSN_OLD_CHKSUM来做到"前后呼应"，判断页面的修改是否是完整的：
+
+1. 通过后4个字节，检查和FIL_PAGE_LSN的后半部分（后4个字节）是否一致
+2. 通过页面内容来计算出checksum，用前4个字节以及页头的checksum（FIL_PAGE_SPACE_OR_CHKSUM）是否一致
+
+{{</hint>}}
+
+{{< hint info>}}
+
+在页面头上记录一个标志，如时间戳，然后在页面尾上也记录一个相同的标志，当读取数据页面后，只要检查一下标志是否相同即可证明页面是否存在部分写。需要注意的是每次页面更新后，标志也必须同时进行修改，不能使用原有页面的标志。还有一些代价更大的方法，如生成整个页面的摘要，然后记录到页头中，除了可以检查页面的部分写之外，还能防止页面被恶意篡改，但这对系统资源的消耗比较大。一种热衷的办法是计算部分页面数据的摘要，但要包含页面头和页面尾，这样就可以能检测页面的部分写，也能部分达到防止篡改的目的。
+
+{{</hint>}}
+
+其中页类型如下：
+
+````
+#define FIL_PAGE_INDEX      17855           /*!< B-tree node */
+#define FIL_PAGE_RTREE      17854           /*!< B-tree node */
+#define FIL_PAGE_UNDO_LOG       2           /*!< Undo log page */
+#define FIL_PAGE_INODE          3           /*!< Index node */
+#define FIL_PAGE_IBUF_FREE_LIST 4           /*!< Insert buffer free list */
+/* File page types introduced in MySQL/InnoDB 5.1.7 */
+#define FIL_PAGE_TYPE_ALLOCATED 0           /*!< Freshly allocated page */
+#define FIL_PAGE_IBUF_BITMAP    5           /*!< Insert buffer bitmap */
+#define FIL_PAGE_TYPE_SYS       6           /*!< System page */
+#define FIL_PAGE_TYPE_TRX_SYS   7           /*!< Transaction system data */
+#define FIL_PAGE_TYPE_FSP_HDR   8           /*!< File space header */
+#define FIL_PAGE_TYPE_XDES      9           /*!< Extent descriptor page */
+#define FIL_PAGE_TYPE_BLOB      10          /*!< Uncompressed BLOB page */
+#define FIL_PAGE_TYPE_ZBLOB     11          /*!< First compressed BLOB page */
+#define FIL_PAGE_TYPE_ZBLOB2    12          /*!< Subsequent compressed BLOB page */
+#define FIL_PAGE_TYPE_UNKNOWN   13          /*!< In old tablespaces, garbage in FIL_PAGE_TYPE is replaced with this value when flushing pages. */
+#define FIL_PAGE_COMPRESSED     14          /*!< Compressed page */
+#define FIL_PAGE_ENCRYPTED      15          /*!< Encrypted page */
+#define FIL_PAGE_COMPRESSED_AND_ENCRYPTED 16/*!< Compressed and Encrypted page */
+#define FIL_PAGE_ENCRYPTED_RTREE 17         /*!< Encrypted R-tree page */
+````
+
+## 区
+
+页是innoDB访问和存储的最小单位，区是InnoDB申请空间的最小单位，一个区由64个连续的页组成，大小为1MB。区的管理和分配由FSP_HDR页（第0页）和XDES页共同完成，其中表空间的元信息存储在FSP_HDR页的space header中，占用112个字节。
+
+区分为可用区（用于分配给段 extent）和碎片区（frag extent），可用区通过保存在空闲区链表（FSP_FREE）中。InnoDB为了节约存储空间，数据首先保存在32个碎片页中，碎片页从碎片区中分配，超过32个碎片页后，再以区的方式从空闲区链表中申请空间。碎片区不属于任何段，保存在碎片半满区链表（FSP_FREE_FRAG）和碎片全满区链表（FSP_FULL_FRAG）中。
+
+表空间可以看做是由多个区组成的一个“大文件块”，使用时按照从低到高的页偏移量顺序地进行区空间的申请。FSP_FREE_LIMIT表示当前已经已经申请到的位置。超过FSP_FREE_LIMIT的部分表示区还未进行初始化。
+
+space header保存的元信息如下：
+
+| 字段                | 大小 | 说明                                                         |
+| :------------------ | :--- | :----------------------------------------------------------- |
+| FSP_SPACE_ID        | 4    | 表空间ID，由数据字典分配                                     |
+| FSP_NOT_USED        | 4    | -                                                            |
+| FSP_SIZE            | 4    | 表空间总的page数量，扩展文件时需要更新（fsp_try_extend_data_file_with_pages），物理分配界限 |
+| FSP_FREE_LIMIT      | 4    | 未分配的最小page no，该offset之后的都尚未加到空闲区链表（FSP_FREE）上，逻辑分配界限 |
+| FSP_SPACE_FLAGS     | 4    | 表空间flags                                                  |
+| FSP_FRAG_N_USED     | 4    | 碎片区（FSP_FREE_FRAG）中已经使用的页的数量，每当从FSP_FREE_FRAG分配一个空闲页出去时，+1，可快速计算表空间的可用碎片页数 |
+| FSP_FREE            | 16   | 空闲区链表，用户从这里以区为单位申请加入到段链表中           |
+| FSP_FREE_FRAG       | 16   | 碎片半满区链表，该链表中的区中的页要么属于不同的段，要么还未分配 |
+| FSP_FULL_FRAG       | 16   | 碎片全满区链表，当由page从该链表的区中释放时，则将该区移回碎片半满区链表 |
+| FSP_SEG_ID          | 8    | 下一个段的ID，在表空间中，每个段都有唯一的编号，即段ID，每次分配段后+1 |
+| FSP_SEG_INODES_FULL | 16   | 已经完全用满的segment inode页链表（也称为段inode全满页链表） |
+| FSP_SEG_INODES_FREE | 16   | 至少存在一个空闲的segment inode entry的segment inode页链表（也称为段inode未满页链表） |
+
+{{< hint info>}}
+
+对于用户表空间来说，当小于64个页时，FSP_FREE_LIMIT却为64（因为区是分配的最小粒度），但是物理上并没有分配这么多的空间，可能只分配了4个页（初始状态）。
+
+{{</hint>}}
+
+区空间的申请通过函数fsp_fill_free_list实现，如果空间大小允许，每次申请4个区（FSP_FREE_ADD），如果申请的区包含碎片区，则申请5个区。申请的区的信息更新到space header。
+
+每个区包含了64个页，由区描述符（XDE entry）表示。每 个区（意味着256个XDE entry）存储在一个XDE page里。
+
+**区描述符**
+
+区描述符（XDES extent descriptor 40 bytes）使用位图表示64个页的使用状态，每个页的状态占用2位（XDES_FREE_BIT/XDES_CLEAN_BIT），一共需要64*2 = 128 bits = 16 bytes。区描述符的结构如图所示：
+
+![InnoDB_storage_XDES](/InnoDB_storage_XDES.png)
+
+| 字段           | 大小 | 说明                                                         |
+| :------------- | :--- | :----------------------------------------------------------- |
+| XDES_ID        | 8    | 如果区已分配给段，则记录其段ID（segment inode entry.FSEG_ID） |
+| XDES_FLST_NODE | 12   | 区所在的链表节点：FSP_FREE、FSP_FREE_FRAG / FSP_FULL_FRAG、或者位于某个B+树的segment inode entry链表中 |
+| XDES_STATE     | 4    | 区状态XDES_FREE     ：空闲区，待分配给段，在FSP_FREE链表中 XDES_FREE_FRAG：碎片半满区，在FSP_FREE_FRAG链表中 XDES_FULL_FRAG：碎片全满区，在FSP_FULL_FRAG链表中 XDES_SEG      ：已分配给段，记录段ID |
+| XDES_BITMAP    | 16   | 区中64个页的使用状态，用2个bit表示一个页 XDES_FREE_BIT  ：该页是否空闲 XDES_CLEAN_BIT：未使用，保留位 |
+
+一个区描述符占40字节，一页可以保存256个区描述符（40 * 256 = 10240，不会用满，剩余5986字节未用），该XDES页可以描述总共16384个页面的信息（64个页 * 256个区描述符），这样，每隔16384个页分配一个XDES页（第0页，同时也分配第1页IBUF_BITMAP page），即每个XDES页的页号都是16384的倍数，函数xdes_calc_descriptor_page用于计算区描述符所在的页面位置（offset），即XDES entry可以用page no+boffset（在XDES page中的相对位置）描述。
+
+虽然一个XDES page保存256个XDES，但是第1个用于存放XDES元信息，只用了后面的255个区，也就是说，之后后面的255个区放到了表空间的链表管理中。并且，区描述符的管理不需要链表进行串联，这是因为区是连续分配的，每64个区就有一个XDES page，直接通过*64就可以定位到任意一个XDES page。
+
+同时由于space header存储在页（0，0）中，所以区描述符保存的开始位置在页的偏移量150字节处（FIL_HEADER + SPACE_HEADER 38 + 112）。同时，如果一个区中的页含有区描述符，则该区为碎片区。
+
+另外，FSP_HDR页中的剩余5986字节的未使用空间中，可以存储该表空间的加密信息（encryption）：
+
+| 字段                       | 大小 | 说明                                                         |
+| :------------------------- | :--- | :----------------------------------------------------------- |
+| ENCRYPTION_MAGIC_SIZE      | 4    | 加密版本，即version ENCRYPTION_KEY_MAGIC_V1 ENCRYPTION_KEY_MAGIC_V2 |
+| master_key_id              | 1    | key_id                                                       |
+| ENCRYPTION_SERVER_UUID_LEN | 36   | server_uuid                                                  |
+| ENCRYPTION_KEY_LEN         | 32   | key                                                          |
+
+## 段
+
+段用来保存特定对象的数据。在InnoDB中，表是最常见的对象，同时表中的数据是通过索引组织表的方式组织的，即通过主键值以B+树索引的方式存储数据的。在InnoDB中，每个表至少有两个段，叶子节点段（leaf segment）和非叶子节点段（non leaf segment），段依据区的形式组织存储空间。
+
+但是为了更有效的管理存储空间，如果表非常小，或者undo段，都不需要一个完整的区来保存数据。那么，在存储数据时，每个段设计了32个碎片页，段中的空间首先保存在这32个碎片页中，如果不够了再以区为单位申请空间。碎片页从空闲碎片区列表（FSP_FREE_FRAG）中的一个碎片区中分配，具体的函数为fsp_alloc_free_page。段中的区从空闲区链表（FSP_FREE）中申请分配。
+
+一个段可以管理32个独立的页和若干个区。段的这种页+区混合管理的方式可以更有效的节约存储空间。表空间一旦将一块空间（一个页或者一个区）分配给一个段后，就不能再给别人使用了。所以，InnoDB存储引擎管理数据的思路是：从创建表开始，随着表中数据的增加，段每次从表空间中获取一个页，当获取到32个页后，则从表空间中获取一个区，这样，既保证了空间使用率，又兼顾了空间分配效率。
+
+那么抽象来看，一个段是可以“无限扩展的”，并且段是由若干区+碎片页组成的，是一个逻辑概念，而区是实实在在的物理存储，物理上是连续的。表空间中的若干段都由若干独立的区链接起来，这些链接起来的区链表长短不一，并且磁盘位置是随机的，逻辑上是连续的。
+
+segment inode entry用于保存段的信息：
+
+| 字段                 | 大小 | 说明                                                         |
+| :------------------- | :--- | :----------------------------------------------------------- |
+| FSEG_ID              | 8    | 段ID（分配从1开始，0表示未分配）                             |
+| FSEG_NOT_FULL_N_USED | 4    | FSEG_NOT_FULL链表中使用的页数量                              |
+| FSEG_FREE            | 16   | 已分配给该段，但完全没有使用的区链表                         |
+| FSEG_NOT_FULL        | 16   | 已分配给该段，全部页未被用满的区链表（也称为段未满区链表）   |
+| FSEG_FULL            | 16   | 已分配给该段，全部页已被使用的区链表（也称为段已满区链表）   |
+| FSEG_MAGIC_N         | 4    | magic number                                                 |
+| FSEG_FRAG_ARR 0..31  | 128  | 碎片页链表，一共有32个页，保存了每个碎片页在表空间中的偏移量（4），因此总共需要32 * 4个字节 |
+
+从上面可以看到，一个segment inode entry占用192个字节，这样一个segment inode页可以存储85个segment inode entry，页类型为FIL_PAGE_INODE。
+
+segment inode页结构如下：
+
+| 字段                   | 大小 | 说明                                                         |
+| :--------------------- | :--- | :----------------------------------------------------------- |
+| FSEG_INODE_PAGE_NODE   | 12   | segment inode页的链表节点，链表是FSP_SEG_INODES_FULL/FSP_SEG_INODES_FREE |
+| segment inode entry 0  | 192  | segment inode entry                                          |
+| segment inode entry 1  | 192  | segment inode entry                                          |
+| ...                    |      |                                                              |
+| segemnt inode entry 84 |      | segment inode entry                                          |
+
+但是和XDES页不同的是，每个segment inode entry的位置不是固定的，不像XDES页都是间隔16384，同时，一个表可能存在多个索引，每个索引有2个段，所以一个表会有多个segment inode entry。为了找到segment inode entry的位置，还需要有一个segment header（10字节），由segment header指向segment inode entry。
+
+| 字段             | 大小 | 说明                                           |
+| :--------------- | :--- | :--------------------------------------------- |
+| FSEG_HDR_SPACE   | 4    | segment inode页所在的表空间ID                  |
+| FSEG_HDR_PAGE_NO | 4    | segment inode页所在的表空间的偏移量            |
+| FSEG_HDR_OFFSET  | 2    | segment inode entry在segment inode页中的偏移量 |
+
+对于用户表来说，segment header总是保存在其索引的root页中，指向叶子节点段的inode页（leaf segment）和非叶子节点段的inode页（non leaf segment）。但是segment header也并不是总是这一页，比如在change buffer中放在一个单独的页中。
+
+root页中的segment info描述了non leaf segment和leaf segment的segment header（10+10字节）：
+
+| 字段              | 大小                  | 说明                                         |
+| :---------------- | :-------------------- | :------------------------------------------- |
+| PAGE_BTR_SEG_LEAF | 10 (FSEG_HEADER_SIZE) | leaf segment在segment inode page中的位置     |
+| PAGE_BTR_SEG_TOP  | 10 (FSEG_HEADER_SIZE) | non leaf segment在segment inode page中的位置 |
+
+当创建一个索引的时候，实际上就是在构建一个新的B+树（btr_create），先为non leaf segment分配一个segment inode entry（从FSP_SEG_INODES_FREE找到一个空闲的segment inode页，从中分配segment inode entry），然后创建root page（根节点页，其位于segment inode entry的第一个碎片页），并将该segment inode entry的位置信息更新到root page上；之后在分配leaf segment的segment inode entry，过程同上。
+
+## 表空间
+
+从上面可以看到，表空间是一个逻辑概念，由文件系统的物理文件组成，然后组织成页、区、段，如下图所示：
+
+![InnoDB_storage_tablespace_organization](/InnoDB_storage_tablespace_organization.png)
+
+表空间的逻辑结构如下图所示：
+
+![InnoDB_storage_tablespace_layout](/InnoDB_storage_tablespace_layout.png)
+
+从上图可以看出，表空间管理的是空闲区、碎片半满区和碎片全满区，segment inode page中的segment inode entry中存放的是具体某一段分配的空闲区、半满区和全满区。
