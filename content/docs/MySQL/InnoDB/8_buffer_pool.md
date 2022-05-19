@@ -194,6 +194,7 @@ RU链表中还包含没有被解压的压缩页，这些压缩页刚从磁盘读
 
 ![InnoDB_buffer_pool_buf_page_state](/InnoDB_buffer_pool_buf_page_state.png)
 
+
 下面依次解释一下这8种状态：
 
 - BUF_BLOCK_NOT_USED：处于free链表中的数据页，都是此状态。此状态为长态。
