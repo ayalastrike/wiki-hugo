@@ -17,6 +17,8 @@ typora-copy-images-to: ../../../../static
 - when to read pages into memory, and when to write them to disk.
 - the goal is minimize the number of stalls from having to read data from disk.
 
+在以下章节中，InnoDB数据结构中的buf_block_t，buf_page_t、frame按照Jim Gray的命名进行转换，称为block（以下称为PCB，包含meta+data）、meta和frame（data）。
+
 # 概述
 
 ## buffer pool
@@ -31,7 +33,7 @@ InnoDB是基于磁盘存储的存储引擎，磁盘中的记录以页为单位�
 
 {{</hint>}}
 
-当数据库读取页时，首先分配一个页的控制块，然后通过该控制块将页"FIX"住，然后发起磁盘IO从磁盘将实际的页读入buffer pool，访问完数据后再”UNFIX“该控制块。下次再读取该页时，先从buffer pool中查找，否则再走上面的流程从磁盘读取。
+当数据库读取页时，首先分配一个PCB，然后通过该PCB将页"FIX"住，然后发起磁盘IO从磁盘将实际的页读入buffer pool，将frame指向加载的页数据，访问完数据后再”UNFIX“该PCB。下次再读取该页时，先从buffer pool中查找，否则再走上面的流程从磁盘读取。
 
 当数据库修改页时，首先通过上面的机制保证页在buffer pool中后，进行"FIX“，修改页内的数据后，”UNFIX“，此时前台的数据修改完成。后台再以一定的频率（至少在checkpoint时）同步/异步刷回磁盘（原地写/追加写）。
 
@@ -45,35 +47,50 @@ InnoDB是基于磁盘存储的存储引擎，磁盘中的记录以页为单位�
 
 而AHI和lock info是不持久化的，生命周期仅限于运行时。锁也是在事务的生命周期里产生的，在crash recovery时会根据事务信息重建锁状态，所以锁不需要持久化，另外，每个锁信息通常是在trx_lock_t.lock_heap中分配。而AHI是根据访问的数据行动态建立的hashtable，无需保留。
 
-buffer pool通过page table（也称为page hashtable，其Key是space_id, page_no，value是page在内存中的地址）可以快速找到已经被读入内存的数据页，而不用线性遍历LRU List去查找。这里的page table不是AHI，AHI是为了减少B+树的扫描，而page hash是为了避免扫描链表（LRU List）。
+## PCB、meta和frame
 
-AHI在B+tree一章详细介绍。
+前面讲过，buffer pool的资源单位为页。为了管理页，页在缓冲池中按照PCB为单元进行管理，其中包括meta和data（frame）。
 
-## 页和控制块
-
-前面讲过，buffer pool的资源单位为页。为了管理页，页在缓冲池中按照控制块（buf_block_t）为单元进行管理（称为PCB（Page Control Block）），其中的页元信息用buf_page_t表示，数据（数据页）在内存中对应的内存空间用frame表示，指向实际的内存数据区域。从这里可以看出，InnoDB参考了Jim Gray的命名方式。
-
-控制块和其中的元信息、数据页之间的关系如下图所示：
+PCB和其中的meta、frame（数据页）之间的关系如下图所示：
 
 ![InnoDB_buffer_pool_page_&_block](/InnoDB_buffer_pool_page_&_block.png)
 
-从上面的页和控制块布局可以看出，buf_block_t中的第一个字段（必须）就是buf_page_t，以保证page table指向的buf_block_t和buf_page_t两种类型的指针可以相互转换。block→frame指向真正存放数据的数据页。
+从上面的内存布局可以看出，PCB中的第一个字段（必须）是meta，以保证page table指向的buf_block_t和buf_page_t两种类型的指针可以相互转换，block→frame指向真正存放数据的数据页。
 
-buf_page_t实际上存放的是数据页的元信息：page size、state、oldest_modification、newest_modification、access_time等等。如果某个压缩页被解压了，解压页的数据指针是存储在buf_block_t的frame字段里。
+meta中的元信息有：page size、state、oldest_modification、newest_modification、access_time...，对于压缩页，解压后的实际数据指针也是用frame指向。
+
+{{< hint info>}}
 
 如果对表进行了压缩，则对应的数据页称为压缩页，如果需要从压缩页中读取数据，则压缩页需要先解压，形成解压页，解压页为16KB。压缩页的大小是在建表的时候指定，目前支持16K，8K，4K，2K，1K。即使压缩页大小设为16K，在blob/varchar/text的类型中也有一定好处。假设指定的压缩页大小为4K，如果有个数据页无法被压缩到4K以下，则需要做B-tree分裂操作，这是一个比较耗时的操作。正常情况下，Buffer Pool中会把压缩和解压页都缓存起来，当Free List不够时，按照系统当前的实际负载来决定淘汰策略。如果系统瓶颈在IO上，则只驱逐解压页，压缩页依然在Buffer Pool中，否则解压页和压缩页都被驱逐。
 
+{{</hint>}}
+
+## page table
+
+buffer pool通过page table（也称为page hashtable，其Key是space_id, page_no，value是PCB地址）可以快速找到已经被读入内存的数据页，而不用线性遍历LRU List去查找。这里的page table不是AHI，AHI是为了减少B+树的扫描，而page hash是为了避免扫描链表（LRU List）。
+
+AHI在B+tree一章详细介绍。
+
 ## buffer chunk
 
-从MySQL 5.7开始，支持动态调整buffer pool的大小（resizing），由此引入了buffer chunk的概念，可以简单的将buffer chunk理解为一块花布，里面是page里的数据网格，每次调整buffer pool按照花布为粒度进行批量处理。
+从MySQL 5.7开始，支持动态调整buffer pool的大小（resizing），由此引入了buffer chunk的概念，可以简单的将buffer chunk理解为一块花布，里面是page里的数据网格，每次调整buffer pool按照花布为粒度进行批量处理（即支持遍历访问）。
 
-chun size的大小可以通过[innodb_buffer_pool_chunk_size](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_chunk_size)设定（默认128M），buffer chunk的数量=缓冲池instance大小/chunk size，同样，为了避免性能问题，buffer chunk不应该超过1000。
+chunk size的大小可以通过[innodb_buffer_pool_chunk_size](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_chunk_size)设定（默认128M），buffer chunk的数量=缓冲池instance大小/chunk size，同样，为了避免性能问题，buffer chunk不应该超过1000。
 
 一个buffer chunk的结构如下：
 
 ![InnoDB_buffer_pool_buffer_chunk](/InnoDB_buffer_pool_buffer_chunk.png)
 
-buffer chunk的初始化只在InooDB启动或者resizing时进行（buf_chunk_init），向memory allocator申请chunk size大小的内存（mmap），并按照页的大小串到free链表上，即把buffer pool打好格子，格子内划分为一组buf_block_t。通过遍历一个chunk可以访问大多数的数据页（比如查找压缩页 buf_chunk_contains_zip），有两种状态的数据页除外：没有被解压的压缩页（BUF_BLOCK_ZIP_PAGE）以及被修改过且解压页已经被驱逐的压缩页（BUF_BLOCK_ZIP_DIRTY）。
+~~~~
+struct buf_chunk_t{
+    ulint       size;           一共有多少页（PCB[]+frame[]）
+    unsigned char*  mem;        指向frame[]首地址
+    ut_new_pfx_t    mem_pfx;    指向allocator的地址（包括cookie），用于deallocator
+    buf_block_t*    blocks;     PCB[]
+};
+~~~~
+
+buffer chunk的初始化只在InooDB启动或者resizing时进行（buf_chunk_init），向memory allocator申请chunk size大小的内存（mmap），并按照页的粒度串到free链表上，即把buffer pool打好格子，格子内划分为一组buf_block_t。通过遍历一个chunk可以访问大多数的数据页（比如查找压缩页 buf_chunk_contains_zip），有两种状态的数据页除外：没有被解压的压缩页（BUF_BLOCK_ZIP_PAGE）以及被修改过且解压页已经被驱逐的压缩页（BUF_BLOCK_ZIP_DIRTY）。
 
 {{< hint info>}}
 
@@ -97,7 +114,7 @@ NUMA的内存分配策略（[mbind](https://man7.org/linux/man-pages/man2/mbind.
 
 {{</hint>}}
 
-## buffer pool中的页链表
+## 页链表
 
 buffer pool中的内存空间以页的倍数来申请，即以页为单位进行管理。
 
@@ -154,15 +171,15 @@ Hash table size 276671, used cells 15, node heap has 1 buffer(s)
 0.00 hash searches/s, 0.00 non-hash searches/s
 ````
 
-buffer pool中的页不仅用于读取，也可能被修改，被修改的页称为脏页（dirty page），脏页肯定在LRU链表中，同时也在flush链表中。LRU链表用于管理缓冲池中页的可用性，flush链表用于管理页的刷回，两者互不影响。
+buffer pool中的页不仅用于读取，也可能被修改，被修改的页称为脏页（dirty page），脏页肯定在LRU链表中，同时也在flush链表中。LRU链表用于管理缓冲池中页的可用性，flush链表用于管理页的刷回（LRU也会触发刷回），两者互不影响。
 
 下图是free链表，LRU链表，flush链表之间的关系：
 
 ![InnoDB_buffer_pool free_LRU_flush](/InnoDB_buffer_pool free_LRU_flush.png)
 
-RU链表中还包含没有被解压的压缩页，这些压缩页刚从磁盘读取出来，还没来的及被解压。
+LRU链表中还包含没有被解压的压缩页，这些压缩页刚从磁盘读取出来，还没来的及被解压。
 
-关于LRU算法的详情下面再讨论。
+关于LRU算法的详情下面讨论。
 
 另外，如果启用页压缩，则还使用了以下的页链表：
 
@@ -182,9 +199,14 @@ RU链表中还包含没有被解压的压缩页，这些压缩页刚从磁盘读
 
 ## buffer pool的组织
 
-从上面的介绍可以看出，buffer pool把页作为基本单位，并通过block作为控制块，然后再组合成一个chunk，多个chunk组合成一个instance。因此，buffer pool的层次结构如下图所示：
+从上面的介绍可以看出，buffer pool把页作为基本资源单位，并通过一系列PCB+frame作为chunk，多个chunk组合成一个instance，形成一个完整的buffer pool。buffer pool的层次结构如下图所示：
 
 ![InnoDB_buffer_pool_hierarchical](/InnoDB_buffer_pool_hierarchical.png)
+
+其中，buffer pool中分配的内存地址需要16KB对齐，这是基于以下两方面的考虑：
+
+- 性能：内存地址对齐可以减少内存的传输次数
+- 支持DIRECT_IO：数据页的DIRECT_IO要求内存地址4KB对齐
 
 ## 页的状态
 
@@ -220,6 +242,212 @@ RU链表中还包含没有被解压的压缩页，这些压缩页刚从磁盘读
 - BUF_BLOCK_ZIP_DIRTY：即在flush链表中的compressed page。如果一个压缩页对应的解压页被evict，但是需要保留这个压缩页并且该压缩页是脏页，则被标记为BUF_BLOCK_ZIP_DIRTY（buf_LRU_free_page）。如果该压缩页随后又被解压，则状态会变为BUF_BLOCK_FILE_PAGE。因此BUF_BLOCK_ZIP_DIRTY也是暂态。这种类型的数据页都在flush list中。
 
 整体来说，大部分的数据页都处于BUF_BLOCK_NOT_USED状态（在free链表中）和BUF_BLOCK_FILE_PAGE状态（大部分处于LRU链表中，LRU链表中还包含除被purge线程标记的BUF_BLOCK_ZIP_PAGE状态的数据页），少部分处于BUF_BLOCK_MEMORY状态，极少数处于其他状态。前三种状态的数据页都不在buffer chunks上，对应的控制体都是临时分配的，这三种状态也称为invalid state（buf_block_state_valid）。
+
+## buffer pool concurrency control
+
+buffer pool中并发访问通过mutex来进行保护，包括：
+
+- PCB
+- 各种页链表的管理
+- buffer pool
+
+buffer pool的并发控制机制和性能密切相关。最开始，InnoDB通过buffer_pool→mutex来控制并发，即buffer pool中的所有读取、查询、刷新、状态修改等操作都需要持有该mutex，极易形成hotspot。随后，InnoDB将其拆分为多个并发访问的保护对象：缓冲池mutex（buf_pool_t->mutex）、压缩页（buf_pool_t->zip_mutex）、flush链表mutex（buf_pool_t→flush_list_mutex）、PCB.mutex。
+
+内存的并发控制要点：
+
+1. 多个对象之间的封锁传递性
+2. 加锁从大到小crabbing
+3. 可以采用引用计数减少竞争
+4. 通过相容性提供更高并发
+5. 前后台路径的正交影响
+
+### free/LRU/flush list mutex
+
+所有的数据页都在free/LRU/flush list上，所以如果操作这些list，首先需要获得list mutex，然后在进行IO的操作前，把list mutex释放。
+
+MySQL 5.7提供了flush_list_mutex
+
+MySQL 8.0新增了free_list_mutex、LRU_list_mutex
+
+### page table rwlock
+
+page table提供了内存页的快速查找，提供的是page table slot的rw lock（hash_table_t→sync_obj.rw_locks），5.6之前是整个page table.mutex。
+
+加锁路径为：page table slot lock→ block/frame lock
+
+### block mutex
+
+block mutex保护的是PCB中meta的buf_fix_count、io_fix、state等等元信息，其目的是减少buffer pool mutex、frame rwlock的竞争。
+
+在代码里的说明：
+
+~~~~
+buf_block_t {
+  ...
+  BPageLock	lock;		/* read-write lock of the buffer frame */
+  BPageMutex	mutex;		/* mutex protecting this block:
+                                  state (also protected by the buffer pool mutex), io_fix, buf_fix_count, and accessed;
+                                  we introduce this new mutex in InnoDB-5.1 to relieve contention on the buffer pool mutex */
+}
+~~~~
+
+加锁流程如下：
+
+1. FIX page （S/X）
+2. buf_page_t.buf_fix_count++ / buf_page_t.io_fix++（block mutex只在操作++--时使用）
+3. UNFIX page （--）
+
+这里看一下buf_fix_count和io_fix。
+
+io_fix 表示当前的page frame正在进行读写IO操作：
+
+- BUF_IO_READ：为读取从磁盘加载中
+- BUF_IO_WRITE：为写入从磁盘加载中
+
+这里不同的fix代表：读写时buffer pool中没有该页，需要从磁盘加载上来（BUF_IO_READ/BUF_IO_WRITE）
+
+PIN代表已在buffer pool中，正在被访问，相当于引用计数（使用buf_fix_count），不能从buffer pool中刷掉。每次访问都会++，在最后mtr.commit时–。判断该page是否可以访问不用通过frame rwlock，而是通过buf_fix_count>0，这代表已被FIX，这可以减少frame rwlock的竞争。
+
+这里有两方面的优化目的：
+
+- 在用户的正向路径上减少frame rwlock的调用
+- 在后台路径上减少frame rwlock的调用：刷脏，replace
+
+比如在flush page时要检测其是否可以被flush，直接判断io_fix：
+
+~~~~
+buf_flush_ready_for_flush
+if (bpage->oldest_modification == 0
+	    || buf_page_get_io_fix(bpage) != BUF_IO_NONE) {
+		return(false);
+}
+~~~~
+
+检查page是否可以被replace，判断io_fix，并且确保当前没有其他线程在引用，也要保证没有修改过：
+
+~~~~
+buf_flush_ready_for_replace
+  if (buf_page_in_file(bpage)) {
+		return(bpage->oldest_modification == 0
+		       && bpage->buf_fix_count == 0
+		       && buf_page_get_io_fix(bpage) == BUF_IO_NONE);
+	}
+~~~~
+
+### frame rwlock
+
+在实际获取一个page时（buf_page_get_gen），流程如下：
+
+1. FIX block
+2. block→buf_fix_count++ / block→io_fix++
+3. 同步读取，block->io_fix--
+4. lock page frame rwlock
+5. UNFIX block（block->buf_fix_count–，unlock page frame rwlock）、后台异步读取后（buf_page_io_complete）（block->buf_fix_count–，unlock page frame rwlock）
+
+从这里也可以看出，如果io_fix设置了，则用户线程需要等待IO完成，不会获取page frame rwlock，这样做尽可能的减少持有page frame rwlock的机会。因为page frame rwlock的调用在B+树的核心路径上。
+
+那我们再接着讨论rwlock的加锁类型。InnoDB在访问B+树的时候，会采用乐观访问的方式，先对page frame加S lock，如果可能修改，再加SX lock，确认要修改的时候加X lock。
+
+另外，只有叶子节点才使用page frame rwlock来保护page frame的一致性，对于非叶子节点通过索引（dict_index_t→lock）来进行保护。
+
+InnoDB还做了很多优化，比如之前MySQL 5.6会拿着整颗B+树的index lock，而是尽可能的只拿着会引起B+树结构变化的子树，比如引入SX lock，在真正要修改的时候才会获得X lock。
+
+{{< hint info>}}
+
+引入SX lock是对读取的优化, 对写入并没有优化. 因为持有SX lock 的时候, S lock 操作是可以进行的, 但是X lock 操作不可以。即允许更多的读取，X lock的并发度和之前一样。
+
+{{</hint>}}
+
+从上面我们可以看出，这些优化只是对用户的前台访问路径有效果（减少了page frame rwlock的获取），而在后台路径上并没有过多的优化。
+
+比如上面提到的，在后台路径的异步IO场景下，page frame rw_lock是在buf_page_io_complete 之后才会放开的。因此page frame rw_lock 的持有周期是整个异步IO的周期，直到IO操作完成。而page frame rw_lock又是用户访问路径（B+树）的核心路径（btr_cur_search_to_nth_level），所以可能会因为后台异步IO而对用户的访问造成大量堵塞，如果是非叶子节点，影响范围更大，更明显。而异步IO卡顿的出现可能是因为InnoDB simulated AIO 的队列长度是（io_read_threads+io_write_threads）* 256，可能会出现大量的page在IO等待队列中，page 因为在IO 等待队列中等待，如果存储设备的IO latency恶化，问题会更加明显。
+
+当然我们也通过simulated AIO 优化, copy page等等减少持有page frame 的时长.
+
+buf_page_io_complete主要做两个工作：
+
+1. page io_fix设置成NONE，表示这个page的io操作已经完成
+2. 将page frame rw_lock释放（如果是读，释放X lock，如果是写，释放SX lock）
+
+这里读操作要拿X lock主要是为了避免多个线程同时去读这个page，如果同时有其他线程要访问该page（在1，2之间），会尝试加S lock（buf_wait_for_read），如果S lock加成功，则说明该page已IO读取完成（2步完成）。
+
+最后总结一下buffer pool的并发控制：
+
+- free/LRU/flush list的操作通过相关的list mutex保护
+- 后面4个mutex（引入block mutex、buf_fix_count/io_fix避免不必要的获得page frame rw_lock的开销）
+  - 先加page hash slot rwlock
+  - 获得block mutex
+  - 释放page hash slot rwlock
+  - 修改buf_fix_count/io_fix
+  - 释放block mutex
+  - 持有page frame rw_lock
+  - 操作完成后修改buf_fix_count，释放page frame rw_lock
+
+## buffer pool warmup
+
+MySQL 5.6引入了buffer pool warmup功能，解决以下问题：
+
+- MySQL冷启动以后数据的预热问题
+- 运行时的OLAP污染buffer pool
+
+为此，提供dump+load机制进行warmup。
+
+功能实现上也简单，通过buf_dump_thread后台线程，如果收到srv_buf_dump_event事件通知，则遍历缓冲池instance，将缓冲池中的页按照<space_id, page_no>的方式dump到文件中。在遍历过程中，需要对buffer_pool→mutex加锁，所以会引起性能抖动，需要注意。同时，在load时，因为会有大量的IO读发生，所以最好warmup后再提供服务。
+
+在buf_load实现中，先把外储的文件读入内存，然后使用归并排序对数据排序（因为page no代表了物理位置），以64个数据页为单位进行IO合并，然后发起一次真正的读取操作。排序的作用就是便于IO合并。
+
+warmup功能的相关参数如下：
+
+{{< hint info>}}
+
+[innodb_buffer_pool_dump_at_shutdown](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_dump_at_shutdown)
+
+[innodb_buffer_pool_load_at_startup](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_load_at_startup)
+
+[innodb_buffer_pool_dump_now](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_dump_now)
+
+[innodb_buffer_pool_load_abort](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_load_abort)
+
+[innodb_buffer_pool_dump_pct](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_dump_pct)
+
+[innodb_buffer_pool_filename](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_filename)
+
+{{</hint>}}
+
+## buffer pool resizing
+
+为了支持计算资源（内存）的弹性控制，MySQL 5.7提供了在运行时动态调整缓冲池大小（resizing）的功能。
+
+我们从之前的介绍可以得知，每个缓冲池instance都是由相同数量的buffer chunks组成的，每个buffer chunk的大小通过[innodb_buffer_pool_chunk_size](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_buffer_pool_chunk_size)指定（实际上会稍大5%，因为需要存放PCB）。在resizing的时候以chunk size为单位进行动态增大/缩小，调整完毕后缓冲池的大小=innodb_buffer_pool_chunk_size * innodb_buffer_pool_instances的倍数。
+
+resizing通过buf_resize_thread完成，在resizing的过程中可以通过[Innodb_buffer_pool_resize_status](https://dev.mysql.com/doc/refman/5.7/en/server-status-variables.html#statvar_Innodb_buffer_pool_resize_status)查看状态。
+
+下面来看一下resizing的处理过程：
+
+1. 根据新的buffer pool size计算每个缓冲池instance新的chunks数量
+2. 禁用AHI（并清空AHI）
+3. 收缩：
+   1. 锁buffer_poo→mutex
+   2. 从free链表中把待删除chunk上的page放入待删除链表（buffer_poo→withdraw）
+   3. 如果上述page为脏页，则刷脏
+   4. 解锁
+   5. 重复a~d直至收缩收集完成
+4. resizing
+   1. 锁buffer_pool->mutex、page hash
+   2. 从待删除链表中以chunk为单位收缩buffer pool
+   3. 清空待删除链表
+   4. 扩大buffer pool：分配新的chunks
+   5. buffer pool重新分配所有的chunks
+   6. 如果扩大/收缩超过2倍，重置page hash，改变hash桶大小
+   7. 解锁
+   8. 果扩大/收缩超过2倍，重启和buffer pool大小相关的内存结构，如锁系统（lock_sys_resize），AHI（btr_search_sys_resize），数据字典（dict_resize）
+5. 开启AHI
+
+从上面可以看到，扩容比缩容相对容易。在收缩时，如果有事务一致未提交，并且占用了待收缩的页，导致收缩一直重试，则会通过日志输出。同时，为了避免频繁重试，重试的时长处采用指数形式增长。
+
+另外，resizing后，serach过程中的btr cursor保存的page可能重新进行了加载，AHI也都进行了清空，都需要重新读取。
+
+# LRU
 
 ## LRU算法
 
