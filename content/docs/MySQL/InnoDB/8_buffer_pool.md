@@ -75,7 +75,7 @@ meta中的元信息有：page size、state、oldest_modification、newest_modifi
 
 buffer pool通过page table（也称为page hashtable，其Key是space_id, page_no，value是PCB地址）可以快速找到已经被读入内存的数据页，而不用线性遍历LRU List去查找。这里的page table不是AHI，AHI是为了减少B+树的扫描，而page hash是为了避免扫描链表（LRU List）。
 
-AHI在B+tree一章详细介绍。
+AHI在B+ tree一章详细介绍。
 
 ## buffer chunk
 
@@ -442,7 +442,7 @@ resizing通过buf_resize_thread完成，在resizing的过程中可以通过[Inno
    5. buffer pool重新分配所有的chunks
    6. 如果扩大/收缩超过2倍，重置page hash，改变hash桶大小
    7. 解锁
-   8. 果扩大/收缩超过2倍，重启和buffer pool大小相关的内存结构，如锁系统（lock_sys_resize），AHI（btr_search_sys_resize），数据字典（dict_resize）
+   8. 如果扩大/收缩超过2倍，重启和buffer pool大小相关的内存结构，如锁系统（lock_sys_resize），AHI（btr_search_sys_resize），数据字典（dict_resize）
 5. 开启AHI
 
 从上面可以看到，扩容比缩容相对容易。在收缩时，如果有事务一致未提交，并且占用了待收缩的页，导致收缩一直重试，则会通过日志输出。同时，为了避免频繁重试，重试的时长处采用指数形式增长。
@@ -503,7 +503,7 @@ LRU链表的布局如下图所示：
 
 
 
-这样的设计也不是没有问题，维护clock的开销和访问成正比，这会是一个hotspot。
+这样的设计有个问题，维护clock的开销和访问成正比，这会是一个hotspot。
 
 ## 维护策略
 
@@ -539,7 +539,7 @@ LRU相关的函数调用链如下：
 
 留给读者2个小问题：
 
-1. 官方图中的OLD区头部是静态的吗？
+1. 官方图中的OLD区指针（LRU_old）是静态的吗？什么时候会进行调整？
 2. 如何计算评估evict和keep in memory的策略？
 
 {{</hint>}}
@@ -587,43 +587,51 @@ LRU相关的函数调用链如下：
 
 {{</hint>}}
 
-另外，再次重生PCB.meta中的buf_fix_count和io_fix两个变量，这两个变量主要用来做并发控制，减少mutex锁定的范围。当从buffer pool读取数据页时，会其加读锁，然后递增buf_page_t::buf_fix_count，同时设置buf_page_t::io_fix为BUF_IO_READ，然后即可以释放读锁。后续如果其他线程在驱逐数据页(或者刷脏)的时候，需要先检查一下这两个变量，如果buf_page_t::buf_fix_count不为零且buf_page_t::io_fix不为BUF_IO_NONE，则不允许驱逐(buf_page_can_relocate)。这里的技巧主要是为了减少PCB上mutex的争抢，而对数据页的内容（frame），读取的时候依然要加读锁，修改时加写锁。
+另外，再次重申一下PCB.meta中的buf_fix_count和io_fix两个变量，这两个变量主要用来做并发控制，减少mutex锁定的范围。当从buffer pool读取数据页时，会其加读锁，然后递增buf_page_t::buf_fix_count，同时设置buf_page_t::io_fix为BUF_IO_READ，然后即可以释放读锁。后续如果其他线程在驱逐数据页(或者刷脏)的时候，需要先检查一下这两个变量，如果buf_page_t::buf_fix_count不为零且buf_page_t::io_fix不为BUF_IO_NONE，则不允许驱逐(buf_page_can_relocate)。这里的技巧主要是为了减少PCB上mutex的争抢，而对数据页的内容（frame），读取的时候依然要加读锁，修改时加写锁。
 
 读取页面的函数调用链如下：
 
 ~~~~
 buf_page_get_gen
-	buf_page_hash_get_low				// 从page hash中查找（缓冲池）
-	miss: block= null
-		buf_read_page					// 物理读取
-			buf_read_page_low			
-				buf_page_init_for_read	// 从缓冲池中通过LRU算法分配对象buf_block_t，加block->mutex，并加x-latch（block->lock）,用以保护其指向的内存（block->frame，即页的实际存储的内容）
-				fil_io					// 读取磁盘上的数据页
-				buf_page_io_complete	// 同步/异步IO完成，释放x-latch
-					buf_page_set_io_fix	// 释放io_fix
-			buf_read_ahead_random		// 随机预读
-		failed retry 100...				// 物理读取失败则重试100次
-	hit: fix_block= block
-	buf_block_fix						// FIX page
-	update buf_page->access_time		// 更新page ts
-	buf_read_ahead_linear				// 线性读取
-	buf_page_make_young_if_needed		// 更新LRU
+  buf_page_hash_get_low        // 从page hash中查找（缓冲池）
+  miss: block= null
+    buf_read_page              // 物理读取
+      buf_read_page_low			
+        buf_page_init_for_read // 从缓冲池中通过LRU算法分配对象buf_block_t，加block->mutex，并加x-latch（block->lock）,用以保护其指向的内存（block->frame，即页的实际存储的内容）
+        fil_io                 // 读取磁盘上的数据页
+        buf_page_io_complete   // 同步/异步IO完成，释放x-latch
+          buf_page_set_io_fix  // 释放io_fix
+      buf_read_ahead_random    // 随机预读
+    failed retry 100...        // 物理读取失败则重试100次
+  hit: fix_block= block
+  buf_block_fix                // FIX page
+  update buf_page->access_time // 更新page ts
+  buf_read_ahead_linear        // 线性读取
+  buf_page_make_young_if_needed// 更新LRU
 ~~~~
 
 以下是buf_page_get_gen的详细流程：
 
 1. 通过page_id（space_id+page_no）查找数据页位于哪个buffer pool instance中，instance_no = (space_id << 20 + space_id + page_no >> 6) % instance_number，即通过space_id+page_no算出一个fold值然后按照instance取余。这里有个小细节，page_no的第六位被砍掉，这是为了保证一个extent的数据（2的6次方=64）能被缓存到同一个buffer pool instance中，便于后面的预读操作。
+
 2. 在page table中查找page，返回PCB（buf_page_hash_get_low）
+
 3. 如果没有在buffer pool中，并且mode为BUF_GET_IF_IN_POOL_OR_WATCH则设置watch数据页（buf_pool_watch_set）
+
 4. 如果没有在buffer pool中，并且mode为BUF_GET_IF_IN_POOL | BUF_PEEK_IF_IN_POOL | BUF_GET_IF_IN_POOL_OR_WATCH，则返回null，表示没有找到数据页。
+
 5. 如果没有在buffer pool中，并且mode为其他，发起磁盘同步读取（buf_read_page）(buf_read_page)。
    在读取磁盘数据之前，如果是非压缩页，则先从free链表中获取空闲的数据页，如果没有，则需要通过同步刷脏来释放数据页，最后将获取到的空闲数据页加到LRU链表上（buf_page_init_for_read）
    如果是压缩页，则临时分配一个buf_page_t用来做控制体，通过伙伴系统（buf_buddy_alloc）分配到压缩页存数据的空间，最后同样加入到LRU List中。
+
 6. 调用IO子系统的接口同步读取页面数据（fil_io + IORequest::READ）。
    如果读取失败，重试100次（BUF_PAGE_READ_MAX_RETRIES，每次重新从#1开始），然后触发断言中止mysqld（Unable to read page + abort）
    如果成功，则判断是否要进行随机预读（buf_read_ahead_random）
+
 7. 判断读取的数据页是不是压缩页，如果是的话，因为从磁盘中读取的压缩页的控制体是临时分配的，所以需要重新分配block（buf_LRU_get_free_block），把临时分配的buf_page_t给释放掉，用buf_relocate函数替换掉，接着进行解压，解压成功后，设置state为BUF_BLOCK_FILE_PAGE，最后加入Unzip LRU链表中。
+
 8. 接着，我们判断这个页是否是第一次访问（buf_page_is_accessed），如果是则设置buf_page_t::access_time。
+
    如果mode不为BUF_PEEK_IF_IN_POOL，判断是否把这个数据页移到young list中（buf_page_make_young_if_needed）。
    如果mode不为BUF_GET_NO_LATCH，给数据页加上读写锁。
    如果mode不为BUF_PEEK_IF_IN_POOL，并且这个数据页是第一次访问，则判断是否需要进行线性预读。
@@ -959,7 +967,7 @@ InnoDB的预读是在后台异步完成的。
 
 页的更改流程为：页面的更新通过FIX rules进行保护，并在FIX期间生产变更的日志（mini-transaction）存入private repo，并在mtr.commit时写入redo log buffer，然后依赖force-log-at-commit在事务提交时将日志持久化。而实际的脏页随后再以异步的方式写回磁盘。
 
-### 加入flush list
+## 加入flush list
 
 flust list中保存的是虽有未写回磁盘原处的脏页，这些脏页在mtr.commit时加入flush list（release_latches），并释放latch（具体流程在mini-transaction中详细介绍）。一旦写入到flush list中，flush list的页面顺序就不再更改，即flush list的顺序是按照mtr.commit，也就是LSN的顺序排列的（oldest_modification），这从语义上代表着写入序（变更序）。如果页面再次发生修改，则更新newest_modification。
 
