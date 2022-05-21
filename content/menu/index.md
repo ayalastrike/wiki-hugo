@@ -34,4 +34,5 @@ headless: false
         - [page]({{< relref "/docs/MySQL/InnoDB/6_page.md" >}})
         - [storage]({{< relref "/docs/MySQL/InnoDB/7_storage.md" >}})
         - [buffer pool]({{< relref "/docs/MySQL/InnoDB/8_buffer_pool.md" >}})
+        - [B+ tree]({{< relref "/docs/MySQL/InnoDB/9_b_tree.md" >}})
     - [Replication]({{< relref "/docs/MySQL/Replication" >}})

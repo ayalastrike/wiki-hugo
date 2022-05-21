@@ -1043,3 +1043,29 @@ page cleaner线程分为一个协调线程和多个工作线程，协调线程�
 我们以一张图的方式从整体和细节上来纵览：
 
 ![InnoDB_buffer_pool_flush_page](/InnoDB_buffer_pool_flush_page.png)
+
+
+
+# MySQL 8.0改进
+
+MySQL在宕机时，会生成巨大的core文件。在MySQL 8.0.14中，引入了[innodb_buffer_pool_in_core_file](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_buffer_pool_in_core_file)在core文件中剔除缓冲池页面，极大的缩小了core文件的大小。（需要linux kernel 3.4以上，支持MADV_DONTDUMP non-POSIX extension to madvise()）
+
+把全局大锁buffer pool mutex拆分了，各个链表由其专用的mutex保护，大大提升了访问扩展性。实际上这是由percona贡献给上游的，而percona在5.5版本就实现了这个特性（[WL#8423](https://dev.mysql.com/worklog/task/?spm=a2c4e.10696291.0.0.6a8919a4Tczoe3&id=8423): InnoDB: Remove the buffer pool mutex 以及 [bug#75534](https://bugs.mysql.com/bug.php?spm=a2c4e.10696291.0.0.21b619a4njE2AI&id=75534)）。
+
+原来的一个大mutex被拆分成多个为free_list, LRU_list, zip_free, 和zip_hash单独使用mutex:
+
+- LRU_list_mutex for the LRU_list;
+- zip_free mutex for the zip_free arrays;
+- zip_hash mutex for the zip_hash hash and in_zip_hash flag;
+- free_list_mutex for the free_list and withdraw list.
+- flush_state_mutex for init_flush, n_flush, no_flush arrays.
+
+由于log system采用lock-free的方式重新实现，flush_order_mutex也被移除了，带来的后果是flush list上部分page可能不是有序的，进而导致checkpoint lsn和以前不同，不再是某个log record的边界，而是可能在某个日志的中间，给崩溃恢复带来了一定的复杂度（需要回溯日志）
+
+log_free_check也发生了变化，当超出同步点时，用户线程不再自己去做preflush，而是通知后台线程去做，自己在那等待(log_request_checkpoint), log_checkpointer线程会去考虑log_consider_sync_flush，这时候如果你打开了参数innodb_flush_sync的话, 那么flush操作将由page cleaner线程来完成，此时page cleaner会忽略io capacity的限制，进入激烈刷脏
+
+8.0还增加了一个新的参数叫innodb_fsync_threshold，，例如创建文件时，会设置文件size,如果服务器有多个运行的实例，可能会对其他正常运行的实例产生明显的冲击。为了解决这个问题，从8.0.13开始，引入了这个阈值，代码里在函数os_file_set_size注入，这个函数通常在创建或truncate文件之类的操作时调用，表示每写到这么多个字节时，要fsync一次，避免对系统产生冲击。这个补丁由facebook贡献给上游。
+
+其他 当然也有些辅助结构来快速查询buffer pool:
+
+adaptive hash index: 直接把叶子节点上的记录索引了，在满足某些条件时，可以直接定位到叶子节点上，无需从根节点开始扫描，减少读的page个数 page hash: 每个buffer pool instance上都通过辅助的page hash来快速访问其中存储的page，读加s锁，写入新page加x锁。page hash采用分区的结构，默认为16，有一个参数innodb_page_hash_locks，但很遗憾，目前代码里是debug only的，如果你想配置这个参数，需要稍微修改下代码，把参数定义从debug宏下移出来 change buffer: 当二级索引页不在时，可以把操作缓存到ibdata里的一个btree(ibuf)中，下次需要读入这个page时，再做merge；另外后台master线程会也会尝试merge ibuf。

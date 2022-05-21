@@ -54,6 +54,7 @@ static MYSQL_SYSVAR_ULONG(page_size, srv_page_size,
 我们下面逐个拆解：PAGE_HEADER、PAGE_DIRECTORY和记录的组织。
 
 {{< hint info >}}
+
 FIL_HEADER、FIL_TRAIL存储的是表空间相关的信息，在此不展开，具体信息参见storage management一节。
 
 {{</hint>}}
