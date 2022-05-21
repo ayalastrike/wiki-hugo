@@ -336,7 +336,7 @@ buf_flush_ready_for_replace
 
 ### frame rwlock
 
-frame通过PCB.block（buf_block_t.block）保护
+frame通过PCB.lock（buf_block_t.lock）保护
 
 在实际获取一个page时（buf_page_get_gen），流程如下：
 
