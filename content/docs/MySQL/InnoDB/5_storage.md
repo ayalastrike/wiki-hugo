@@ -1,6 +1,7 @@
 ---
 typora-root-url: ../../../../static
 typora-copy-images-to: ../../../../static
+title: storage
 ---
 
 存储管理是数据库系统最基本的功能，本章将介绍InnoDB存储引擎中数据在外存中的组织形式（即数据文件）、数据文件在内存中的管理方式以及数据在文件层次的读/写。

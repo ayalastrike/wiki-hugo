@@ -1,6 +1,7 @@
 ---
 typora-root-url: ../../../../static
 typora-copy-images-to: ../../../../static
+title: page
 ---
 
 InnoDB使用的是索引组织表，因此聚簇索引的叶子节点中存放完整的数据记录，辅助索引页的叶子节点中存放指向聚簇索引页叶子节点的书签（bookmark），也可以称为路标。

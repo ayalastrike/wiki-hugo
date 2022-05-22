@@ -1,6 +1,7 @@
 ---
 typora-root-url: ../../../../static
 typora-copy-images-to: ../../../../static
+title: buffer pool
 ---
 
 基于磁盘的数据库系统通常都是用缓冲池（buffer pool）技术来弥补CPU和磁盘之间的速度鸿沟。
@@ -1042,15 +1043,342 @@ flush_lru_list checkpoint是指InnoDB要保证LRU链表和free链表中至少要
 
 我们下面以MySQL 5.7.4后的多线程刷脏为例来介绍异步刷脏机制。
 
-page cleaner线程分为一个协调线程和多个工作线程，协调线程本身也是工作线程，也需要进行刷脏的工作。工作队列长度为缓冲池instance的个数，使用一个全局slot数组表示（page_clean_t→slots: page_cleaner_slot_t）。page cleaner线程并未和缓冲池instance绑定，而是每次进入REQUESTED状态后，寻找一个空闲的slot进行刷脏。
+page cleaner线程分为一个协调线程和多个工作线程，同时协调线程本身也是工作线程，也需要进行刷脏的工作。工作队列长度为缓冲池instance的个数，使用一个全局slot数组表示（page_clean_t→slots: page_cleaner_slot_t）。page cleaner线程并未和缓冲池instance绑定，而是每次进入REQUESTED状态后，寻找一个空闲的slot进行刷脏。
 
-其中的核心数据结构是page_cleaner_t、page_cleaner_slot_t和page_cleanere_state_t。
+其中的核心数据结构是page_cleaner_t、page_cleaner_slot_t和page_cleaner_state_t以及两种线程buf_flush_page_cleaner_coordinator、buf_flush_page_cleaner_worker。
 
 ### 整体纵览
 
 我们以一张图的方式从整体和细节上来纵览：
 
 ![InnoDB_buffer_pool_flush_page](/InnoDB_buffer_pool_flush_page.png)
+
+### 协调线程
+
+buf_flush_page_cleaner_coordinator协调线程的主循环主线程以最多1s的间隔或者收到buf_flush_event事件来发起进行一轮刷脏。协调线程首先会调用pc_request()函数，这个函数的作用就是为每个slot所代表的缓冲池instance计算要刷脏多少页，然后把每个slot的state置为PAGE_CLEANER_STATE_REQUESTED，并且唤醒buf_flush_page_chealner_worker。由于协调线程也会和工作线程一样做具体的刷脏操作，所以在唤醒工作线程之后，自己调用pc_flush_slot()，和其它的工作线程并行去做刷脏页操作。完成自己的刷脏操作后，调用pc_wait_finished()等待所有的工作线程完成本轮的刷脏。在完成这一轮的刷脏之后，协调线程会收集一些统计信息，比如这轮刷脏所用的时间，以及对LRU和flush_list队列刷脏的页数等等。然后会根据当前的负载计算应该sleep的时间、以及下次刷脏的页数，为下一轮的刷脏做准备。在主循环线程跳过与多线程刷脏不相关的部分，主循环的核心主要就集中在pc_request()、pc_flush_slot()以及pc_wait_finished()三个函数的调用上。精简后的部分代码如下：
+
+~~~~c++
+	while (srv_shutdown_state == SRV_SHUTDOWN_NONE) {
+
+		if (ret_sleep != OS_SYNC_TIME_EXCEEDED
+		    && srv_flush_sync
+		    && buf_flush_sync_lsn > 0) {
+			/* woke up for flush_sync */
+			mutex_enter(&page_cleaner->mutex);
+			lsn_t	lsn_limit = buf_flush_sync_lsn;
+			buf_flush_sync_lsn = 0;
+			mutex_exit(&page_cleaner->mutex);
+
+			/* Request flushing for threads */
+			pc_request(ULINT_MAX, lsn_limit);
+
+			/* Coordinator also treats requests */
+			while (pc_flush_slot() > 0) {}
+
+			/* Wait for all slots to be finished */
+			ulint	n_flushed_lru = 0;
+			ulint	n_flushed_list = 0;
+			pc_wait_finished(&n_flushed_lru, &n_flushed_list);
+
+			if (n_flushed_list > 0 || n_flushed_lru > 0) {
+				buf_flush_stats(n_flushed_list, n_flushed_lru);
+
+				MONITOR_INC_VALUE_CUMULATIVE(
+					MONITOR_FLUSH_SYNC_TOTAL_PAGE,
+					MONITOR_FLUSH_SYNC_COUNT,
+					MONITOR_FLUSH_SYNC_PAGES,
+					n_flushed_lru + n_flushed_list);
+			}
+			n_flushed = n_flushed_lru + n_flushed_list;
+		} 
+	}
+~~~~
+
+### 工作线程
+
+buf_flush_page_cleaner_worker工作线程的主循环启动后就等在page_cleaner_t的is_requested事件上，一旦协调线程通过is_requested唤醒所有等待的工作线程，工作线程就调用pc_flush_slot()函数去完成刷脏动作。
+
+### 核心函数
+
+pc_request这个函数的作用主要就是为每个slot代表的缓冲池实例计算要刷脏多少页；然后把每个slot的state设置PAGE_CLEANER_STATE_REQUESTED；把n_slots_requested设置成当前slots的总数，也即缓冲池实例的个数，同时把n_slots_flushing和n_slots_finished清0，然后唤醒等待的工作线程。这个函数只会在协调线程里调用，其核心代码如下：
+
+~~~~c++
+static
+void
+pc_request(
+	ulint		min_n,
+	lsn_t		lsn_limit)
+{
+	mutex_enter(&page_cleaner->mutex);					// 由于page_cleaner是全局的，在修改之前先获取互斥锁						
+
+	page_cleaner->requested = (min_n > 0);				// 是否需要对flush_list进行刷脏操作，还是只需要对LRU列表刷脏
+	page_cleaner->lsn_limit = lsn_limit;				// 设置lsn_limit, 只有小于lsn_limit的数据页的oldest_modification才会刷盘
+
+	for (ulint i = 0; i < page_cleaner->n_slots; i++) {
+		page_cleaner_slot_t* slot = &page_cleaner->slots[i];
+
+		// 为两种特殊情况设置每个slot需要刷脏的页数，当为ULINT_MAX表示服务器比较空闲，则刷脏线程可以尽可能的把当前的所有脏页都刷出去；而当为0是，表示没有脏页可刷。
+		if (min_n == ULINT_MAX) {
+			slot->n_pages_requested = ULINT_MAX;
+		} else if (min_n == 0) {
+			slot->n_pages_requested = 0;
+		}
+
+		/* slot->n_pages_requested was already set by
+		page_cleaner_flush_pages_recommendation() */
+
+		slot->state = PAGE_CLEANER_STATE_REQUESTED;    // 在唤醒刷脏工作线程之前，将每个slot的状态设置成requested状态
+	}
+	// 协调线程在唤醒工作线程之前，设置请求要刷脏的slot个数，以及清空正在刷脏和完成刷脏的slot个数。只有当完成的刷脏个数等于总的slot个数时，才表示本轮的刷脏结束。
+	page_cleaner->n_slots_requested = page_cleaner->n_slots;
+	page_cleaner->n_slots_flushing = 0;
+	page_cleaner->n_slots_finished = 0;
+
+	os_event_set(page_cleaner->is_requested);
+
+	mutex_exit(&page_cleaner->mutex);
+}
+~~~~
+
+pc_flush_slot是刷脏线程真正做刷脏动作的函数，协调线程和工作线程都会调用。由于刷脏线程和slot并不是事先绑定对应的关系。所以工作线程在刷脏时首先会找到一个未被占用的slot，修改其状态，表示已被调度，然后对该slot所对应的缓冲池instance进行操作。直到所有的slot都被消费完后，才进入下一轮。通过这种方式，多个刷脏线程实现了并发刷脏缓冲池。一旦找到一个未被占用的slot，则需要把全局的page_cleaner里的n_slots_rqeusted减1、把n_slots_flushing加1，同时这个slot的状态从PAGE_CLEANER_STATE_REQUESTED状态改成PAGE_CLEANER_STATE_FLUSHING。然后分别调用buf_flush_LRU_list() 和buf_flush_do_batch() 对LRU和flush_list刷脏。刷脏结束把n_slots_flushing减1，把n_slots_finished加1，同时把这个slot的状态从PAGE_CLEANER_STATE_FLUSHING状态改成PAGE_CLEANER_STATE_FINISHED状态。同时若这个工作线程是最后一个完成的，则需要通过is_finished事件，通知协调进程所有的工作线程刷脏结束。 其核心代码如下：
+
+~~~~c++
+static
+ulint
+pc_flush_slot(void)
+{
+	ulint	lru_tm = 0;
+	ulint	list_tm = 0;
+	int	lru_pass = 0;
+	int	list_pass = 0;
+
+	mutex_enter(&page_cleaner->mutex);
+
+	if (page_cleaner->n_slots_requested > 0) {
+		page_cleaner_slot_t*	slot = NULL;
+		ulint			i;
+
+		for (i = 0; i < page_cleaner->n_slots; i++) {    // 由于slot和刷脏线程不是事先定好的一一对应关系，所以在每个工作线程开始要先找到一个未被处理的slot
+			slot = &page_cleaner->slots[i];
+
+			if (slot->state == PAGE_CLEANER_STATE_REQUESTED) {
+				break;
+			}
+		}
+
+		buf_pool_t* buf_pool = buf_pool_from_array(i);   // 根据找到的slot，对应其缓冲池的实例
+
+		page_cleaner->n_slots_requested--;               // 表明这个slot开始被处理，将未被处理的slot数减1
+		page_cleaner->n_slots_flushing++;                // 这个slot开始刷脏，将flushing加1
+		slot->state = PAGE_CLEANER_STATE_FLUSHING;       // 把这个slot的状态设置为flushing状态
+
+		if (page_cleaner->n_slots_requested == 0) {      // 若是所有的slot都处理了，则清除is_requested的通知标志
+			os_event_reset(page_cleaner->is_requested);
+		}
+
+		if (!page_cleaner->is_running) {
+			slot->n_flushed_lru = 0;
+			slot->n_flushed_list = 0;
+			goto finish_mutex;
+		}
+
+		mutex_exit(&page_cleaner->mutex);
+
+		/* Flush pages from end of LRU if required */
+		slot->n_flushed_lru = buf_flush_LRU_list(buf_pool);// 开始刷LRU链表
+
+		if (!page_cleaner->is_running) {
+			slot->n_flushed_list = 0;
+			goto finish;
+		}
+
+		/* Flush pages from flush_list if required */
+		if (page_cleaner->requested) {                     // 刷flush_list链表
+
+			list_tm = ut_time_ms();
+
+			slot->succeeded_list = buf_flush_do_batch(
+				buf_pool, BUF_FLUSH_LIST,
+				slot->n_pages_requested,
+				page_cleaner->lsn_limit,
+				&slot->n_flushed_list);
+
+			list_tm = ut_time_ms() - list_tm;
+			list_pass++;
+		} else {
+			slot->n_flushed_list = 0;
+			slot->succeeded_list = true;
+		}
+finish:
+		mutex_enter(&page_cleaner->mutex);
+finish_mutex:
+		page_cleaner->n_slots_flushing--;
+		page_cleaner->n_slots_finished++;
+		slot->state = PAGE_CLEANER_STATE_FINISHED;
+
+		if (page_cleaner->n_slots_requested == 0           // 当所有的工作线程都完成了刷脏，要通知协调进程，本轮刷脏完成
+		    && page_cleaner->n_slots_flushing == 0) {
+			os_event_set(page_cleaner->is_finished);
+		}
+	}
+
+	ulint	ret = page_cleaner->n_slots_requested;
+
+	mutex_exit(&page_cleaner->mutex);
+
+	return(ret);
+}
+~~~~
+
+pc_wait_finished函数的主要由协调线程调用，它主要用来收集每个工作线程分别对LRU和flush_list列表刷脏的页数。以及为每个slot清0次轮请求刷脏的页数和重置它的状态为NONE。
+
+~~~~c++
+static
+bool
+pc_wait_finished(
+	ulint*	n_flushed_lru,
+	ulint*	n_flushed_list)
+{
+	bool	all_succeeded = true;
+
+	*n_flushed_lru = 0;
+	*n_flushed_list = 0;
+
+	os_event_wait(page_cleaner->is_finished);  // 协调线程通知工作线程和完成自己的刷脏任务之后，要等在is_finished事件上，直到最后一个完成的工作线程会set这个事件唤醒协调线程
+
+	mutex_enter(&page_cleaner->mutex);
+
+	for (ulint i = 0; i < page_cleaner->n_slots; i++) {
+		page_cleaner_slot_t* slot = &page_cleaner->slots[i];
+
+		ut_ad(slot->state == PAGE_CLEANER_STATE_FINISHED);
+
+		*n_flushed_lru += slot->n_flushed_lru;   // 统计每个slot分别通过LRU和flush_list队列刷出去的页数
+		*n_flushed_list += slot->n_flushed_list;
+		all_succeeded &= slot->succeeded_list;
+
+		slot->state = PAGE_CLEANER_STATE_NONE;   // 把所有slot的状态设置为NONE
+
+		slot->n_pages_requested = 0;             // 每个slot请求刷脏的页数清零
+	}
+
+	page_cleaner->n_slots_finished = 0;         // 清零完成的slot刷脏个数，为下一轮刷脏重新统计做准备
+
+	os_event_reset(page_cleaner->is_finished);  // 清除is_finished事件的通知标志
+
+	mutex_exit(&page_cleaner->mutex);
+
+	return(all_succeeded);
+}
+~~~~
+
+### 其他flush参数
+
+MySQL还提供了一些参数来控制page cleaner的flush行为：
+
+{{< hint info>}}
+
+[innodb_adaptive_flushing_lwm](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_adaptive_flushing_lwm)
+
+[innodb_max_dirty_pages_pct_lwm](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_max_dirty_pages_pct_lwm)
+
+[innodb_flushing_avg_loops](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_flushing_avg_loops)
+
+[innodb_io_capacity_max](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_io_capacity_max)
+
+[innodb_lru_scan_depth](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_lru_scan_depth)
+
+{{</hint>}}
+
+总的来说，如果你发现redo log推进的非常快，为了避免用户线程陷入刷脏，可以通过调大innodb_io_capacity_max来解决，该参数限制了每秒刷新的脏页上限，调大该值可以增加page cleaner线程每秒的工作量。如果你发现你的系统中free list不足，总是需要驱逐脏页来获取空闲的block时，可以适当调大innodb_lru_scan_depth 。该参数表示从每个buffer pool instance的lru上扫描的深度，调大该值有助于多释放些空闲页，避免用户线程去做single page flush。
+
+page cleaner主要负责flush List的刷脏，避免用户线程同步刷脏页。每隔一定时间或者接到buf_flush_event事件去刷脏页。每次执行刷的脏页数量是自适应的，计算过程有点复杂（`page_cleaner_flush_pages_if_needed）`。其依赖当前系统中脏页的比率，日志产生的速度以及几个参数。innodb_io_capacity和innodb_max_io_capacity控制每秒刷脏页的数量，前者可以理解为一个soft limit，后者则为hard limit。innodb_max_dirty_pages_pct_lwm和innodb_max_dirty_pages_pct_lwm控制脏页比率，即InnoDB什么脏页到达多少才算多了，需要加快刷脏频率了。innodb_adaptive_flushing_lwm控制需要刷新到哪个lsn。innodb_flushing_avg_loops控制系统的反应效率，如果这个变量配置的比较大，则系统刷脏速度反应比较迟钝，表现为系统中来了很多脏页，但是刷脏依然很慢，如果这个变量配置很小，当系统中来了很多脏页后，刷脏速度在很短的时间内就可以提升上去。这个变量是为了让系统运行更加平稳，起到削峰填谷的作用。相关函数，`af_get_pct_for_dirty`和`af_get_pct_for_lsn`。
+
+{{< hint danger>}}
+
+这里给读者留一个小问题，既然page cleaner主要负责flush list刷脏，那什么场景下进行LRU list刷脏？
+
+{{</hint>}}
+
+## hazard pointer
+
+[Hazard Pointer](https://dl.acm.org/doi/10.1109/TPDS.2004.8)提供了一种lock-free的机制：
+
+Each reader thread owns a single-writer/multi-reader shared pointer called "**hazard pointer.**" When a reader thread assigns the address of a map to its hazard pointer, it is basically announcing to other threads (writers), "I am reading this map. You can replace it if you want, but don't change its contents and certainly keep your **`delete`****ing** hands off it."
+
+但在InnoDB中，这个概念不太一样，一个线程可以随时访问Hazard Pointer，但是在访问后，他需要调整指针到一个有效的值，便于其他线程使用，即用Hazard Pointer来加速逆向的逻辑链表遍历。
+
+从之前的page clean工作细节我们可以知道，可能同时有多个线程操作刷脏 ，同时为了减少锁占用的时间，在刷脏时会释放buffer pool mutex，每次刷完一个page后需要回溯到flush链表尾部，使得扫描链表的时间复杂度最差为O（N*N）。
+
+{{< hint info>}}
+
+两个因素叠加在一起导致同一个刷脏线程刷完一个数据页A，就需要回到flush list尾部（因为A之前的脏页可能被其他线程给刷走了，之前的脏页可能已经不在flush list中了），重新扫描新的可刷盘的脏页。另一方面，数据页刷盘是异步操作，在刷盘的过程中，我们会把对应的数据页IO_FIX住，防止其他线程对这个数据页进行操作。我们假设某台机器使用了非常缓慢的机械硬盘，当前flush list中所有页面都可以被刷盘（`buf_flush_ready_for_replace`返回true）。我们的某一个刷脏线程拿到队尾最后一个数据页，IO fixed，发送给IO线程，最后再从队尾扫描寻找可刷盘的脏页。在这次扫描中，它发现最后一个数据页（也就是刚刚发送到IO线程中的数据页）状态为IO FIXED（磁盘很慢，还没处理完）所以不能刷，跳过，开始刷倒数第二个数据页，同样IO FIXED，发送给IO线程，然后再次重新扫描flush list。它又发现尾部的两个数据页都不能刷新(因为磁盘很慢，可能还没刷完)，直到扫描到倒数第三个数据页。所以，存在一种极端的情况，如果磁盘比较缓慢，刷脏算法性能会从O（N）退化成O（N*N）。
+
+{{</hint>}}
+
+最本质的方法就是当刷完一个脏页的时候不要每次都从队尾重新扫描。我们可以使用Hazard Pointer来解决，方法如下：遍历找到一个可刷盘的数据页，在锁释放之前，调整Hazard Pointer使之指向flush list中下一个节点，注意一定要在持有锁的情况下修改。然后释放锁，进行刷盘，刷完盘后，重新获取锁，读取Hazard Pointer并设置下一个节点，然后释放锁，进行刷盘，如此重复。当这个线程在刷盘的时候，另外一个线程需要刷盘，也是通过Hazard Pointer来获取可靠的节点，并重置下一个有效的节点。通过这种机制，保证每次读到的Hazard Pointer是一个有效的flush list节点，即使磁盘再慢，刷脏算法效率依然是O（N）。 这个解法同样可以用到LRU list的evict算法上，提高evict效率。
+
+于是，在MySQL 5.6中针对flush list的扫描做了一定的修复，使用一个指针来记录当前正在flush的page，待flush操作完成后，再看一下这个指针有没有被别的线程修改掉，如果被修改了，就回溯到链表尾部，否则无需回溯。但这个设计并不完整，在最差的情况下，时间复杂度依旧不理想。
+
+因此，在MySQL 5.7版本中对这个问题进行了重新设计，使用多个名为hazard pointer的指针，在需要扫描LRU和flush链表时，存储下一个即将扫描的目标page，根据不同的目的分为几类：
+
+- flush_hp：用作批量刷FLUSH LIST
+- lru_hp：用作批量刷LRU LIST
+- lru_scan_itr：用于从LRU链表上驱逐一个可替换的page，总是从上一次扫描结束的位置开始，而不是LRU尾部
+- single_scan_itr：当buffer pool中没有空闲block时，用户线程会从FLUSH LIST上单独驱逐一个可替换的page 或者 flush一个脏页，总是从上一次扫描结束的位置开始，而不是LRU尾部。
+
+后两类的hp都是由用户线程在尝试获取空闲block时调用，只有在推进到某个buf_page_t::old被设置成true的page (大约从Lru链表尾部起至总长度的八分之三位置的page)时， 再将指针重置到Lru尾部。
+
+这些指针在初始化buffer pool时分配，每个buffer pool instance都拥有自己的hp指针。当某个线程对buffer pool中的page进行操作时，例如需要从LRU中移除Page时，如果当前的page被设置为hp，就要将hp更新为当前Page的前一个page。当完成当前page的flush操作后，直接使用hp中存储的page指针进行下一轮flush。
+
+## 社区优化
+
+一如既往的，Percona Server在5.6版本中针对buffer pool flush做了不少的优化，主要的修改包括如下几点：
+
+- 优化刷LRU流程buf_flush_LRU_tail 该函数由page cleaner线程调用。
+- 原生的逻辑：依次flush 每个buffer pool instance，每次扫描的深度通过参数innodb_lru_scan_depth来配置。而在每个instance内，又分成多个chunk来调用；
+- 修改后的逻辑为：每次flush一个buffer pool的LRU时，只刷一个chunk，然后再下一个instance，刷完所有instnace后，再回到前面再刷一个chunk。简而言之，把集中的flush操作进行了分散，其目的是分散压力，避免对某个instance的集中操作，给予其他线程更多访问buffer pool的机会。
+- 允许设定刷LRU/FLUSH LIST的超时时间，防止flush操作时间过长导致别的线程（例如尝试做single page flush的用户线程）stall住；当到达超时时间时,page cleaner线程退出flush。
+- 避免用户线程参与刷buffer pool 当用户线程参与刷buffer pool时，由于线程数的不可控，将产生严重的竞争开销，例如free list不足时做single page flush，以及在redo空间不足时，做dirty page flush，都会严重影响性能。Percona Server允许选择让page cleaner线程来做这些工作，用户线程只需要等待即可。出于效率考虑，用户还可以设置page cleaner线程的cpu调度优先级。 另外在Page cleaner线程经过优化后，可以知道系统当前处于同步刷新状态，可以去做更激烈的刷脏(furious flush)，用户线程参与到其中，可能只会起到反作用。
+- 允许设置page cleaner线程，purge线程，io线程，master线程的CPU调度优先级，并优先获得InnoDB的mutex。
+- 使用新的独立后台线程来刷buffer pool的LRU链表，将这部分工作负担从page cleaner线程剥离。 实际上就是直接转移刷LRU的代码到独立线程了。从之前Percona的版本来看，都是在不断的强化后台线程，让用户线程少参与到刷脏/checkpoint这类耗时操作中。
+
+## 同步刷脏
+
+从上面的介绍可以看到，用户线程如果从free list中获取不到空闲的block，会进行single page同步刷脏（single page flush），这时性能会受到严重的挑战：
+
+1. 一旦大量线程进入这个状态，就会导致严重性能下降：超频繁的fsync，激烈的dblwr竞争，线程切换等等。
+2. 同样，当redo log可用空间不足时，用户线程也会进入page flush进行同步刷脏，这在高负载场景下很常见（系统运行一段时间后，性能急剧下降。这是因为redo log产生太快，而page flush又跟不上，导致checkpoint无法推进。用户线程做fuzzy checkpoint。到这时性能就基本无法接受了）。
+3. dblwr成为重要的单点瓶颈。 如果文件系统不支持16K原子写，必须打开double write buffer。写入ibdata的doublewrite段中，这里还有锁的开销（single page flush和batch flush），即使采用multiple page cleaner，最终扩展性还是受限于dblwr。
+4. 没有专用的LRU evict线程，LRU evict和刷脏都是page cleaner线程负责。那么，如果缓冲池已满，又有大量的脏页，page cleaner则会因为IO的开销忙于刷脏，用户线程无法从free链表中获得free page，从而进入single page flush场景。
+
+在这几个方面可以参考percona的方案，他们向来擅长优化Io bound场景的性能，并且上述几个问题都解决了，尤其是dblwr，他们做了多分区的改进。
+
+从上面可以看出来同步刷脏对性能影响巨大。另外，还有一些场景也会进行同步刷脏。
+
+### 删除指定表空间所有的数据页
+
+有些场景需要批量清理缓冲池中指定表空间的数据页（buf_LRU_remove_pages），这里分为三种：
+
+- BUF_REMOVE_ALL_NO_WRITE（ALL-no_flush）：删除缓冲池中所有这个类型的数据页（LRU list和flush list），并且flush list中的脏页不写回磁盘，，用于适合rename table和5.6引入的表空间传输特性，因为space_id可能会被复用，所以需要清除内存中的一切，防止后续读取到错误的数据。
+- BUF_REMOVE_FLUSH_NO_WRITE（FLUSH-no_flush）：仅仅删除flush list中的数据页，也不写回磁盘，用于drop table场景。LRU不清理是因为不会被访问到，会随着时间的推移而evict。
+- BUF_REMOVE_FLUSH_WRITE（FLUSH）：将flush list中的脏页都都刷回磁盘，用于表空间关闭场景（比如数据库正常关闭）。
+
+这里需要注意：由于对逻辑链表的变动需要加锁，并且删除指定表空间数据页是一个大操作，容易造成其他请求被饿死，所以InnoDB做了一个小优化（buf_flush_try_yield），即每删除BUF_LRU_DROP_SEARCH_SIZE个数据页（1024）就会释放一下buf_pool->flush_list_mutex，便于其他线程执行。
+
+## 部分写
+
+当将脏页刷回磁盘时，需要考虑部分写（partial write）的问题。这是因为操作系统只保证block（512B/4K）单位的写是原子操作，而InnoDB页的大小是16K。而重做日志也无法解决部分写的问题，这是因为InnoDB的重做日志是物理逻辑日志，页面内的变更是逻辑的，部分写已经造成了页的损坏（不完整），无法在损坏的页上应用逻辑操作。
+
+为此，InnoDB实现了double write（dblwr），其设计思想是：通过shadow page+双副本的方式，当页刷回磁盘时，先通过memcpy写到doublewrite buffer中（2MB），然后doublewrite buffer再分两次，每次1MB顺序的写入磁盘上共享表空间的doublewrite段中，然后马上调用fsync进行同步。然后再将doublewrite buffer中的页刷回磁盘中原数据页的位置。这样，如果发生部分写，则可以通过doublewrite中的页进行恢复。
+
+补充图
+
+通过double write解决了部分写的问题，但是也同时引入了两次fsync的开销，现在更多的存储（文件系统）已经支持16K乃至更大的原子写粒度，这样，就可以完全关闭double write，提升写入性能。
+
+doublewrite存在于内存的表空间中，大小为2MB，这意味着每次最多进行128页的刷新。
+
+
 
 
 
