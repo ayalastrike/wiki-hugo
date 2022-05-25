@@ -26,6 +26,7 @@ title: storage
 - 记录（tuple layout）
 
 {{< hint info >}}
+
 暂不讨论raw device，这里假设数据库的文件存放在操作系统提供的文件系统之上。
 
 {{</hint>}}

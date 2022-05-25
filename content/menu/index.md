@@ -33,5 +33,8 @@ headless: false
         - [storage]({{< relref "/docs/MySQL/InnoDB/5_storage.md" >}})
         - [buffer pool]({{< relref "/docs/MySQL/InnoDB/6_buffer_pool.md" >}})
         - [B+ tree]({{< relref "/docs/MySQL/InnoDB/7_b+_tree.md" >}})
-
+        - [change buffer]({{< relref "/docs/MySQL/InnoDB/8_change_buffer.md" >}})
+        - [redo log]({{< relref "/docs/MySQL/InnoDB/9_redo_log.md" >}})
+        - [lock]({{< relref "/docs/MySQL/InnoDB/10_lock.md" >}})
+        - [transaction]({{< relref "/docs/MySQL/InnoDB/11_transaction.md" >}})
     - [Replication]({{< relref "/docs/MySQL/Replication" >}})

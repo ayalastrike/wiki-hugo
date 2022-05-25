@@ -236,6 +236,8 @@ LRU链表中还包含没有被解压的压缩页，这些压缩页刚从磁盘�
 
   每个缓冲池instance配置配置[purge thread](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_purge_threads)（默认：4）个哨兵数据页控制体，通过buffer_pool->watch数组管理。
 
+  也意味着即使所有purge线程同时访问同一个buffer pool instance，也至少会有一个空闲的watch[n]
+
   {{</hint>}}
 
 - BUF_BLOCK_ZIP_PAGE：也称为clean compressed page（不全面，未包含purge语音）。当从磁盘读取压缩页时，先通过malloc分配一个临时的buf_page_t，然后从伙伴系统中分配出压缩页存储的空间，把磁盘中读取的压缩数据存入其中，然后把这个临时的buf_page_t标记为BUF_BLOCK_ZIP_PAGE状态（buf_page_init_for_read），当这个压缩页被解压时，将页状态修改为BUF_BLOCK_FILE_PAGE，并加入LRU List和Unzip LRU List（buf_page_get_gen）。如果一个压缩页对应的解压页被evict，但是需要保留这个压缩页并且该压缩页不是脏页，则这个压缩页被标记为BUF_BLOCK_ZIP_PAGE（buf_LRU_free_page）。所以正常情况下，处于BUF_BLOCK_ZIP_PAGE状态的不会很多。前面两种被标记为BUF_BLOCK_ZIP_PAGE的压缩页都在LRU list中。另外，上面提到的WATCH状态可以得知，如果被某个purge线程使用了，也会被标记为BUF_BLOCK_ZIP_PAGE。
