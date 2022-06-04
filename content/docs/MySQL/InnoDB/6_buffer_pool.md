@@ -1374,15 +1374,13 @@ Each reader thread owns a single-writer/multi-reader shared pointer called "**ha
 
 为此，InnoDB实现了double write（dblwr），其设计思想是：通过shadow page+双副本的方式，当页刷回磁盘时，先通过memcpy写到doublewrite buffer中（2MB），然后doublewrite buffer再分两次，每次1MB顺序的写入磁盘上共享表空间的doublewrite段中，然后马上调用fsync进行同步。然后再将doublewrite buffer中的页刷回磁盘中原数据页的位置。这样，如果发生部分写，则可以通过doublewrite中的页进行恢复。
 
-补充图
+整个流程如下图所示：
 
-通过double write解决了部分写的问题，但是也同时引入了两次fsync的开销，现在更多的存储（文件系统）已经支持16K乃至更大的原子写粒度，这样，就可以完全关闭double write，提升写入性能。
+![InnoDB_buffer_pool_doublewrite](/InnoDB_buffer_pool_doublewrite.png)
 
-doublewrite存在于内存的表空间中，大小为2MB，这意味着每次最多进行128页的刷新。
+通过double write解决了部分写的问题，但是也同时引入了两次fsync的开销，现在更多的存储（文件系统）已经支持16K乃至更大的原子写粒度，这样，就可以完全关闭double write，提升写入性能。另外，每次flush最多64个页。
 
-
-
-
+doublewrite segment的管理在事务一章讲述。
 
 # MySQL 8.0改进
 

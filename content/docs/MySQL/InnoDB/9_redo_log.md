@@ -600,3 +600,249 @@ log_sys->last_checkpoint_lsn); // 写入checkpoint后更新（log_checkpoint()�
 除此以外，页也有LSN信息：
 FIL_PAGE_LSN：页最后flush时的LSN
 ~~~~
+
+## redo log layout
+
+从上面可以看出，redo log分为内存态的数据和外存态的数据。
+
+在内存中，redo log在mini-transaciton中产生，以stack的结构保存在各个用户线程自己的内存空间中。然后再mini-trnasaction commit时，合并到全局的redo log buffer中，由一个个redo log record组成。
+
+这一层称为逻辑redo log层。
+
+外村中的redo log分为两层，最下层是以文件方式存在（redo log file），块设备（文件）中块的粒度就是redo log block（512 bytes），这是为了保证日志的原子写。这层称为redo log文件层。
+
+为了避免创建文件以及初始化空间、预防文件自增带来的开销，redo log file最常见的一种组织方式是提供n个redo log file首尾相接一个逻辑的文件（ring file），作为redo log表空间，这层称为redo log buffer层。
+
+内存和外存的一致性通过force log at commit机制保证的。
+
+如下图所示：![InnoDB_redo_log_layout](/InnoDB_redo_log_layout.png)
+
+在逻辑redo log层用全局唯一递增的SN表示，并在日志子系统中维护当前SN的最大值（log_sys→lsn）
+
+而在物理层（buffer & 文件）中，抽象出了为了IO读写的log block，并且为了维护log block的元信息（log block header & tailer），在物理层用LSN标识。
+
+LSN和SN的换算关系为：
+
+````
+constexpr inline lsn_t log_translate_sn_to_lsn(lsn_t sn) {
+  return (sn / LOG_BLOCK_DATA_SIZE * OS_FILE_LOG_BLOCK_SIZE +
+          sn % LOG_BLOCK_DATA_SIZE + LOG_BLOCK_HDR_SIZE);
+}
+````
+
+SN加上之前所有的block的header以及tailer的长度就可以换算到对应的LSN，反之亦然。
+
+而在文件层中，InnoDB在每个文件的开头固定预留4个block来记录一些额外的信息，其中第一个block称为header block，之后的3个block在0号文件上用来存储duplex checkpoint信息，而在其他文件上留空。如下图所示：![InnoDB_redo_log_file_group](/InnoDB_redo_log_file_group.png)
+
+逻辑redo是真正需要的数据，用SN索引，逻辑redo按固定大小的block组织，并添加block的头尾信息形成物理redo，以LSN索引，这些block又会放到循环使用的文件空间中的某一位置，文件中用offset索引。
+
+从中可以看出，逻辑redo log层时真正的日志数据，用SN索引；逻辑redo log按固定大小的log block组织在一起，并添加block header+tailer形成物理redo log，用LSN索引；而这些log block又会由循环使用的日志表空间中，在文件中用offset索引，而offset对应的的文件的读写IO。
+
+offset和LSN的转换关系如下：
+
+````
+const auto real_offset =
+      log.current_file_real_offset + (lsn - log.current_file_lsn);
+````
+
+切换文件时会在内存中更新当前文件开头的文件offset，current_file_real_offset，以及对应的LSN，current_file_lsn，通过这两个值可以方便地用上面的方式将LSN转化为文件offset。注意这里的offset是相当于整个redo文件空间而言的，由于InnoDB中读写文件的space层实现支持多个文件，因此，可以将首位相连的多个redo文件看成一个大文件，那么这里的offset就是这个大文件中的偏移。
+
+### redo log buffer
+
+redo log buffer的大小由参数innodb_log_buffer_size控制，默认大小为16MB。
+
+从整体上看，redo log buffer可以看作是由redo log block组成的一个线性数组，每个数组尾头存储数组元素的元信息。
+
+redo log block header中各个字段的含义：
+
+| 字段                      | 大小 | 说明                                                         |
+| :------------------------ | :--- | :----------------------------------------------------------- |
+| LOG_BLOCK_HDR_NO          | 4    | block number，也就是当前log block在redo log buffer（线性数组）中的位置，最高的1个bit用于标识是否flush过，所以整个线性数组的容量是2G (2^（8*4-1） = 2G) |
+| LOG_BLOCK_HDR_DATA_LEN    | 2    | 当前log block已写入了多少字节，如果为0x200则已写满（0x200 = 512） |
+| LOG_BLOCK_FIRST_REC_GROUP | 2    | 当前log block中第一个mtr log record的偏移量                  |
+| LOG_BLOCK_CHECKPOINT_NO   | 4    | log_sys->next_checkpoint_no的低4位，恢复时使用（从CP1/CP2上读取CP后，CP后的redo log block上的该字段都应该大于>CP） |
+
+redo log block tailer中各个字段的含义：
+
+| 字段               | 大小 | 说明                                                         |
+| :----------------- | :--- | :----------------------------------------------------------- |
+| LOG_BLOCK_CHECKSUM | 4    | 该log block的checksum，用于recovery时检测log block是否损坏；在3.23.52之前为LOG_BLOCK_HDR_NO |
+
+我们以一个具体的例子来说明redo log block的组织：有两个事务T1和T2的redo log写入redo log buffer，事务T1的redo log，也就是mtr log record，为1254字节，下图标记为青色，事务T2的mtr log record为100字节，下图标记为黄色。T1需要3个log block才能盛下，T2小于492字节，且T1写入后第3个log block的剩余空间大于100字节，所以放到第三个log block中。那么在这种情况下，我们来看一下头尾的metadata是如何表示的：
+
+- LOG_BLOCK_HDR_NO：从第一个log block到第四个log block的编号依次为0、512、1024、1536，换算成16进制为0x0000、0x0200、0x0400、0x0600
+- LOG_BLOCK_HDR_DATA_LEN：第一个和第二个log block都用完了，所以为512字节（0x0200），第三个块写入了370字节（270+100，0x172），第四个快，否则记录真实的字节数，未使用记录为0（0x0000）
+- LOG_BLOCK_FIRST_REC_GROUP：记录该log block中第一个mtr log record的相对偏移量，对于事务T1，第一个log block相对于该log block的偏移量为12（0x000C），第二个log block用满了492字节，且实际相对于第一个log block数据末尾的偏移量为8+12+492=512（0x0200），即LOG_BLOCK_FIRST_REC_GROUP=LOG_BLOCK_HDR_DATA_LEN，可以根据该公式判断该log block是否有新的mtr log record（即该块为上一个mtr log record的延续），在第三个log block中，T1写入了270就结束了（1254-492-492），事务T2（下图标记为橙色）的mtr log record为该log block的第一个记录，其相对于该log block的偏移量为282（270+12，0x011A），第四块log block没有存放任何mtr log record，为0。
+
+````c++
+if (log_block_get_flush_bit(log_block)) {
+    /* This block was a start of a log flush operation:
+    we know that the previous flush operation must have
+    been completed for all log groups before this block
+    can have been flushed to any of the groups. Therefore,
+    we know that log data is contiguous up to scanned_lsn
+    in all non-corrupt log groups. */
+ 
+    if (scanned_lsn > *contiguous_lsn) {
+        *contiguous_lsn = scanned_lsn;
+    }
+}
+ 
+data_len = log_block_get_data_len(log_block);
+ 
+if (scanned_lsn + data_len > recv_sys->scanned_lsn
+    && log_block_get_checkpoint_no(log_block)
+    < recv_sys->scanned_checkpoint_no
+    && (recv_sys->scanned_checkpoint_no
+    - log_block_get_checkpoint_no(log_block)
+    > 0x80000000UL)) {
+ 
+    /* Garbage from a log buffer flush which was made
+    before the most recent database recovery */
+    finished = true;
+    break;
+}
+````
+
+数据组织为下图所示：
+
+![InnoDB_redo_log_block_example](/InnoDB_redo_log_block_example.png)
+
+### redo log files
+
+redo log日志表空间中的每个redo log file头部会预留2KB（LOG_FILE_HDR_SIZE = (4 * OS_FILE_LOG_BLOCK_SIZE)）信息用于存储文件的元信息（但只有文件0使用），其余部分用于存储log block：
+
+| 存储内容        | 大小 |
+| :-------------- | :--- |
+| log file header | 512  |
+| checkpoint 1    | 512  |
+| /               | 512  |
+| checkpoint 2    | 512  |
+
+如下图所示：
+
+![InnoDB_redo_log_file_group](/InnoDB_redo_log_file_group-1654323649389.png)
+
+从这里可以看到，redo log file的写入并不完全是顺序IO的，因为在将redo log buffer sync到文件block（append only）后，还需要更新头部的checkpoint信息。
+
+log file header内容如下：
+
+| 字段                 | 大小 | 说明                                  |
+| :------------------- | :--- | :------------------------------------ |
+| LOG_HEADER_FORMAT    | 4    | redo log格式版本，目前是v1            |
+| LOG_HEADER_START_LSN | 8    | redo重做日志文件中的第一个日志的lsn   |
+| LOG_HEADER_CREATOR   | 16   | MySQL版本版本信息，比如"MySQL 5.7.26" |
+
+### checkpoint值
+
+checkpoint是crash recovery的关键路径（key point），要最大程度上的保证checkpoint的可用性。因此，设计了两个checkpoint的目的是采用交替写入来避免介质失败。
+
+checkpoint预留了512字节，但实际上使用了32字节：
+
+| 字段                        | 大小 | 说明                                              |
+| :-------------------------- | :--- | :------------------------------------------------ |
+| LOG_CHECKPOINT_NO           | 8    | checkpoint NO，单调递增，每次做完checkpoint+1     |
+| LOG_CHECKPOINT_LSN          | 8    | checkpoint的LSN                                   |
+| LOG_CHECKPOINT_OFFSET       | 8    | checkpoint的LSN对应的在redo log file中的偏移量    |
+| LOG_CHECKPOINT_LOG_BUF_SIZE | 8    | 做checkpoint时，redo log buffer的大小，无实际意义 |
+
+在重启恢复时，只需要恢复LOG_CHECKPOINT_LSN后面的redo log。由于有两个checkpoint，重启时读取两个，采用较大的LOG_CHECKPOINT_LSN。
+
+## sync point & commit point
+
+为了保证redo log buffer刷入redo log file的持久性，每次都要fsync。这是因为InnoDB打开redo log file时并没有使用direct IO（O_DIRECT），所以为了确保数据写入到磁盘上，需要使用fsync的方式保证synchronized IO file integrity completion。而fsync的效率取决于磁盘的性能，而fsync的效率决定了事务提交的性能，也就是写入性能。
+
+sync的时机如下：
+
+- 事务commit时
+- 写入checkpoint时
+- 当log buffer中有已使用空间超过某个阈值时
+
+另外，配置选项[innodb_flush_log_at_trx_commit](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit)和 innodb_flush_method分别控制着**何时（when）**以及**如何（how）**对redo log file进行sync。
+
+### innodb_flush_log_at_trx_commit
+
+InnoDB允许用户通过innodb_flush_log_at_trx_commit参数控制redo log buffer写入和sync的时机，即sync point。
+
+default：1
+
+ innodb_flush_log_at_trx_commit有3个选项，可以根据速度和安全的不同要求加以选择。
+
+- 0：把redo log file每隔1s写入文件，但sync由操作系统控制。换句话说，0不能确保ACID中的D
+- 1：每次事务commit写入文件并sync 
+- 2：折衷，每次事务commit写入文件，每隔1s sync
+
+如下图所示：
+
+![InnoDB_redo_log_innodb_flush_log_at_trx_commit](/InnoDB_redo_log_innodb_flush_log_at_trx_commit.png)
+
+{{< hint danger>}}
+
+DDL changes and other internal InnoDB activities flush the log independently of the innodb_flush_log_at_trx_commit setting.
+
+{{</hint>}}
+
+{{< hint info>}}
+
+**MySQL · 参数故事 · innodb_flush_log_at_trx_commit 摘自阿里数据库内核月报**
+
+**背景**
+
+innodb_flush_log_at_trx_commit 这个参数可以说是InnoDB里面最重要的参数之一，它控制了重做日志（redo log）的写盘和落盘策略。
+
+简单说来，可选值的安全性从0->2->1递增，分别对应于mysqld 进程crash可能丢失 -> OS crash可能丢失 -> 事务安全。
+
+以上是路人皆知的故事，并且似乎板上钉钉，无可八卦……
+
+**innodb_use_global_flush_log_at_trx_commit**
+
+直到2010年的某一天，Percona的CTO Vadim同学觉得这种一刀切的风格不够灵活，最好把这个变量设置成session级别，每个session自己控制。
+
+但同时为了保持Super权限对提交行为的控制，同时增加了innodb_use_global_flush_log_at_trx_commit参数。 这两个参数的配合逻辑为：
+
+　　1、若innodb_use_global_flush_log_at_trx_commit为OFF，则使用session.innodb_flush_log_at_trx_commit;
+
+　　2、若innodb_use_global_flush_log_at_trx_commit为ON,则使用global .innodb_flush_log_at_trx_commit（此时session中仍能设置，但无效）
+
+　　3、每个session新建时，以当前的global.innodb_flush_log_at_trx_commit 为默认值。
+
+**业务应用**
+
+这个特性可以用在一些对表的重要性做等级定义的场景。比如同一个实例下，某些表数据有外部数据备份，或允许丢失部分事务的情况，对这些表的更新，可以设置 Session.innodb_flush_log_at_trx_commit为非1值。
+
+在阿里云RDS服务中，我们对数据可靠性和可用性要求更高，将 innodb_use_global_flush_log_at_trx_commit设置为ON，因此修改session.innodb_flush_log_at_trx_commit也没有作用，统一使用 global.innodb_flush_log_at_trx_commit = 1。
+
+{{</hint>}}
+
+{{< hint warning>}}
+
+- O_SYNC: requires that any write operations block until **all data and all metadata** have been written to persistent storage.
+- O_DSYNC: like O_SYNC, except that there is no requirement to wait for any metadata changes which are not necessary to read the just-written data. In practice, O_DSYNC means that the application does not need to wait until ancillary information (the file modification time, for example) has been written to disk. Using O_DSYNC instead of O_SYNC can often eliminate the need to flush the file inode on a write.
+- O_RSYNC: this flag, which only affects read operations, must be used in combination with either O_SYNC or O_DSYNC. It will cause aread() call to block until the data (and maybe metadata) being read has been flushed to disk (if necessary). This flag thus gives the kernel the option of delaying the flushing of data to disk; any number of writes can happen, but data need not be flushed until the application reads it back.
+
+{{</hint>}}
+
+### innodb_flush_method
+
+[innodb_flush_method](https://dev.mysql.com/doc/refman/5.7/en/innodb-parameters.html#sysvar_innodb_flush_method)选项为InnoDB数据文件和日志文件的同步策略：
+
+- fsync：默认选项，数据文件和日志文件都使用deafult打开，都通过fsync确保写入成功
+- O_DIRECT：使用O_DIRECT打开数据文件，使用default打开日志文件，都通过fsync来确保写入成功
+
+fsync函数只对由文件描述符filedes指定的单一文件起作用，并且等待写磁盘操作结束，然后返回。
+
+open时的参数O_SYNC有着和fsync类似的语义：使每次write都会阻塞等待硬盘IO完成，因为InnoDB在打开数据文件和日志文件时没有指定O_SYNC，所以需要显式调用fsync已确保元信息和数据刷入磁盘。
+
+### binlog sync
+
+在MySQL Server层还有binlog日志，其用来进行point-in-time（PIT）恢复以及在节点间（主从）进行复制。
+
+MySQL本身通过2PC原子协议保证数据提交时redo log file和binlog file的一致。
+
+MySQL也有参数提供了何时sync（when）：[sync_binlog](https://dev.mysql.com/doc/refman/5.7/en/replication-options-binary-log.html#sysvar_sync_binlog)
+
+## checkpoint
+
+从上面我们知道，InnoDB存储引擎为了事务的D，采用write ahead log（WAL）。后续数据页（dirty page）的flush大多数情况下是异步进行的，最低水位线由checkpoint负责，即checkpoint保证其LSN点位之前的所有dirty page都必须持久化到磁盘上。这样，在crash recovery时，只需从checkpoint开始进行redo log apply恢复到内存态即可。
+
+关于checkpoint的两种方式（sharp & fuzzy），在buffer pool的page flush章节，已经做过介绍，在此不再赘述。
