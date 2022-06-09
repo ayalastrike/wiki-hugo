@@ -82,7 +82,7 @@ page header中的字段含义如下：
 | PAGE_DIRECTION    | 2    | 最后插入记录的方向 PAGE_LEFT          0x01 PAGE_RIGHT        0x02 PAGE_SAME_REC     0x03 PAGE_SAME_PAGE    0x04 PAGE_NO_DIRECTION 0x05 |
 | PAGE_N_DIRECTION  | 2    | 一个方向上连续插入记录的数量                                 |
 | PAGE_N_RECS       | 2    | 页中用户记录的数量                                           |
-| PAGE_MAX_TRX_ID   | 8    | 修改当前页的TRX ID，仅在辅助索引和change buffer中使用        |
+| PAGE_MAX_TRX_ID   | 8    | 修改当前页的TRX ID，仅在辅助索引和<font color=red>change buffer</font>中使用 |
 | PAGE_LEVEL        | 2    | 当前页在索引树中的位置，0x00代表叶子节点，即叶子节点总是在第0层（不变性），page_is_leaf |
 | PAGE_INDEX_ID     | 8    | 索引ID，标识当前页属于哪个索引                               |
 | PAGE_BTR_SEG_LEAF | 10   | B+树叶子节点所在段的segment header，仅在B+树的root页中定义   |

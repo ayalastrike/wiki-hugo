@@ -1,16 +1,16 @@
 ---
 typora-root-url: ../../../../static
 typora-copy-images-to: ../../../../static
-title: lock
+title: redo log
 ---
 
 日志或者说logging schema主要是为crash recovery algorithms服务的，即为了保证事务的ACD特性。crash recovery是通过多种机制协调解决的，这里面包括buffer pool的flush策略，WAL、logging schema和checkpoint。并且，InnoDB采用MV2PL，还通过undo log在MVCC中实现delta storage用于存储行的多版本快照。
 
-从这里可以看出，日志在事务处理中的重要性。这里的日志主要分为undo log和redo log，undo log在下一章事务中详细介绍，本章聚焦在redo log。
+从这里可以看出，日志在事务处理中的重要性。这里的日志主要分为undo log和redo log，undo log在下一章事务中详细介绍，本章聚焦在redo log。crash_recovery在事务一章介绍。
 
 # 设计
 
-crash recovery algorithms由IBM在90年代发表的一篇ARIES论文提出（**A**lgorithms for **R**ecovery and **I**solation **E**xploiting **S**emantics）。InnoDB也借鉴了ARIES的思想。思想的核心是利用日志（undo+redo）来实现可恢复性。
+crash recovery algorithms由IBM在90年代发表的一篇`ARIES`论文提出（**A**lgorithms for **R**ecovery and **I**solation **E**xploiting **S**emantics）。InnoDB也借鉴了ARIES的思想。思想的核心是利用日志（undo+redo）来实现可恢复性。
 
 ## redo log
 
@@ -846,3 +846,255 @@ MySQL也有参数提供了何时sync（when）：[sync_binlog](https://dev.mysql
 从上面我们知道，InnoDB存储引擎为了事务的D，采用write ahead log（WAL）。后续数据页（dirty page）的flush大多数情况下是异步进行的，最低水位线由checkpoint负责，即checkpoint保证其LSN点位之前的所有dirty page都必须持久化到磁盘上。这样，在crash recovery时，只需从checkpoint开始进行redo log apply恢复到内存态即可。
 
 关于checkpoint的两种方式（sharp & fuzzy），在buffer pool的page flush章节，已经做过介绍，在此不再赘述。
+
+# MySQL 8.0优化（转）
+
+本节内容转自网络及阿里内核月报。
+
+## WAL流程优化
+
+### **REDO产生**
+
+事务在写入数据的时候会产生REDO，一次原子的操作可能会包含多条REDO记录，这些REDO可能是访问同一Page的不同位置，也可能是访问不同的Page（如Btree节点分裂）。InnoDB有一套完整的机制来保证涉及一次原子操作的多条REDO记录原子，即恢复的时候要么全部重放，要不全部不重放，这部分将在之后介绍恢复逻辑的时候详细介绍，本文只涉及其中最基本的要求，就是这些REDO必须连续。InnoDB中通过min-transaction实现，简称mtr，需要原子操作时，调用mtr_start生成一个mtr，mtr中会维护一个动态增长的m_log，这是一个动态分配的内存空间，将这个原子操作需要写的所有REDO先写到这个m_log中，当原子操作结束后，调用mtr_commit将m_log中的数据拷贝到InnoDB的Log Buffer。
+
+### **写入Log Buffer**
+
+从MySQL 8.0开始，设计了一套无锁的写log机制，其核心思路是允许不同的mtr，同时并发地写Log Buffer的不同位置。不同的mtr会首先调用log_buffer_reserve函数，这个函数里会用自己的REDO长度，原子地对全局偏移[log.sn](http://log.sn/)做fetch_add，得到自己在Log Buffer中独享的空间。之后不同mtr并行的将自己的m_log中的数据拷贝到各自独享的空间内。
+
+~~~~
+/* Reserve space in sequence of data bytes: */
+const sn_t start_sn = log.sn.fetch_add(len);
+~~~~
+
+### **写入Page Cache**
+
+写入到Log Buffer中的REDO数据需要进一步写入操作系统的Page Cache，InnoDB中有单独的log_writer来做这件事情。这里有个问题，由于Log Buffer中的数据是不同mtr并发写入的，这个过程中Log Buffer中是有空洞的，因此log_writer需要感知当前Log Buffer中连续日志的末尾，将连续日志通过pwrite系统调用写入操作系统Page Cache。整个过程中应尽可能不影响后续mtr进行数据拷贝，InnoDB在这里引入一个叫做link_buf的数据结构，如下图所示：
+
+![InnoDB_redo_log_link_buf_1](/InnoDB_redo_log_link_buf_1.png)
+
+link_buf是一个循环使用的数组，对每个lsn取模可以得到其在link_buf上的一个槽位，在这个槽位中记录REDO长度。另外一个线程从开始遍历这个link_buf，通过槽位中的长度可以找到这条REDO的结尾位置，一直遍历到下一位置为0的位置，可以认为之后的REDO有空洞，而之前已经连续，这个位置叫做link_buf的tail。下面看看log_writer和众多mtr是如何利用这个link_buf数据结构的。这里的这个link_buf为log.recent_written，如下图所示：
+
+![InnoDB_redo_log_link_buf_2](/InnoDB_redo_log_link_buf_2.png)
+
+图中上半部分是REDO日志示意图，write_lsn是当前log_writer已经写入到Page Cache中日志末尾，current_lsn是当前已经分配给mtr的的最大lsn位置，而buf_ready_for_write_lsn是当前log_writer找到的Log Buffer中已经连续的日志结尾，从write_lsn到buf_ready_for_write_lsn是下一次log_writer可以连续调用pwrite写入Page Cache的范围，而从buf_ready_for_write_lsn到current_lsn是当前mtr正在并发写Log Buffer的范围。下面的连续方格便是log.recent_written的数据结构，可以看出由于中间的两个全零的空洞导致buf_ready_for_write_lsn无法继续推进，接下来，假如reserve到中间第一个空洞的mtr也完成了写Log Buffer，并更新了log.recent_written*，如下图：
+
+![InnoDB_redo_log_link_buf_3](/InnoDB_redo_log_link_buf_3.png)
+
+这时，log_writer从当前的buf_ready_for_write_lsn向后遍历log.recent_written，发现这段已经连续：
+
+![InnoDB_redo_log_link_buf_4](/InnoDB_redo_log_link_buf_4.png)
+
+因此提升当前的buf_ready_for_write_lsn，并将log.recent_written的tail位置向前滑动，之后的位置清零，供之后循环复用：
+
+![InnoDB_redo_log_link_buf_5](/InnoDB_redo_log_link_buf_5.png)
+
+紧接log_writer将连续的内容刷盘并提升write_lsn。
+
+### 刷盘
+
+log_writer提升write_lsn之后会通知log_flusher线程，log_flusher线程会调用fsync将REDO刷盘，至此完成了REDO完整的写入过程。
+
+### 唤醒用户线程
+
+为了保证数据正确，只有REDO写完后事务才可以commit，因此在REDO写入的过程中，大量的用户线程会block等待，直到自己的最后一条日志结束写入
+
+大量的用户线程调用log_write_up_to等待在自己的lsn位置，为了避免大量无效的唤醒，InnoDB将阻塞的条件变量拆分为多个，log_write_up_to根据自己需要等待的lsn所在的block取模对应到不同的条件变量上去。同时，为了避免大量的唤醒工作影响log_writer或log_flusher线程，InnoDB中引入了两个专门负责唤醒用户的线程：log_wirte_notifier和log_flush_notifier，当超过一个条件变量需要被唤醒时，log_writer和log_flusher会通知这两个线程完成唤醒工作。下图是整个过程的示意图：
+
+![InnoDB_redo_log_log_thread_notify_1](/InnoDB_redo_log_log_thread_notify_1.png)
+
+多个线程通过一些内部数据结构的辅助，完成了高效的从REDO产生，到REDO写盘，再到唤醒用户线程的流程，下面是整个这个过程的时序图：
+
+![InnoDB_redo_log_log_thread_notify_2](/InnoDB_redo_log_log_thread_notify_2.png)
+
+### 推进checkpoint
+
+我们知道REDO的作用是避免只写了内存的数据由于故障丢失，那么打Checkpiont的位置就必须保证之前所有REDO所产生的内存脏页都已经刷盘。最直接的，可以从Buffer Pool中获得当前所有脏页对应的最小REDO LSN：lwm_lsn。 但光有这个还不够，因为有一部分min-transaction的REDO对应的Page还没有来的及加入到Buffer Pool的脏页中去，如果checkpoint打到这些REDO的后边，一旦这时发生故障恢复，这部分数据将丢失，因此还需要知道当前已经加入到Buffer Pool的REDO lsn位置：dpa_lsn。取二者的较小值作为最终checkpoint的位置，其核心逻辑如下：
+
+~~~~
+/* LWM lsn for unflushed dirty pages in Buffer Pool */
+lsn_t lwm_lsn = buf_pool_get_oldest_modification_lwm();
+ 
+/* Note lsn up to which all dirty pages have already been added into Buffer Pool */
+const lsn_t dpa_lsn = log_buffer_dirty_pages_added_up_to_lsn(log);
+ 
+lsn_t checkpoint_lsn = std::min(lwm_lsn, dpa_lsn);
+~~~~
+
+为了去掉flush_order_mutex，就需要允许redo log buffer中对应的脏页无序（并发）添加到flush list，即用户写完redo log buffer，就可以把自己的dirty page(s)添加到flush list而无需抢锁。但是这种方法会造成做checkpoint的时候，无法保证flush list最上面的page lsn是最小的，于是引入了log_closer线程定期检查recent_closed（link_buf）是否连续，如果连续就把 recent_closed buffer 向前推进（提升recent_closed的tail，也就是buffer pool脏页的最大LSN（pda_lsn），类似log.recent_written和log_writer），那么checkpoint 的信息也可以往前推进了。需要注意的是，由于这种乱序的存在，lwm_lsn的值并不能简单的获取当前Buffer Pool中的最老的脏页的LSN，保守起见，还需要减掉一个recent_closed的容量大小，也就是最大的乱序范围，简化后的代码如下：
+
+~~~~
+/* LWM lsn for unflushed dirty pages in Buffer Pool */
+const lsn_t lsn = buf_pool_get_oldest_modification_approx();
+const lsn_t lag = log.recent_closed.capacity();
+lsn_t lwm_lsn = lsn - lag;
+ 
+/* Note lsn up to which all dirty pages have already been added into Buffer Pool */
+const lsn_t dpa_lsn = log_buffer_dirty_pages_added_up_to_lsn(log);
+ 
+lsn_t checkpoint_lsn = std::min(lwm_lsn, dpa_lsn);
+~~~~
+
+这里有一个问题，由于lwm_lsn已经减去了recent_closed的capacity，因此理论上这个值一定是小于dpa_lsn的。那么再去比较lwm_lsn和dpa_lsn来获取Checkpoint位置或许是没有意义的。
+
+在buf_pool_get_oldest_modification_lwm() 还是里面, 会将buf_pool_get_oldest_modification_approx() 获得的 lsn 减去recent_closed buffer 的大小, 这样得到的lsn 可以确保是可以打checkpoint 的, 但是这个lsn 不能保证是最大的可以打checkpoint 的lsn. 而且这个 lsn 不一定是指向一个记录的开始, 更多的时候是指向一个记录的中间, 因为这里会强行减去一个 recent_closed buffer 的size. 而以前在5.6 版本是能够保证这个lsn 是默认一个redo log 的record 的开始位置。
+
+基本思想是，脏页链表的有序性可以被部分的打破，也就是说，在一定范围内可以无序，但是整体还是有序的。这个无序程度是受控的。假设脏页链表第一个数据页的oldest_modification为A, 在之前的版本中，这个脏页链表后续的page的oldest_modification都严格大于等于A，也就是不存在一个数据页比第一个数据页还老。在MySQL 8.0中，后续的page的oldest_modification并不是严格大于等于A，可以比A小，但是必须大于等于A-L，这个L可以理解为无序度，是一个定值。那么问题来了，如果脏页链表顺序乱了，那么checkpoint怎么确定，或者说是，奔溃恢复后，从哪个checkpoint_lsn开始扫描日志才能保证数据不丢。官方给出的解法是，checkpoint依然由脏页链表中第一个数据页的oldest_modification的确定，但是奔溃恢复从checkpoint_lsn-L开始扫描(有可能这个值不是一个mtr的边界，因此需要调整)。
+
+![InnoDB_redo_log_thread](/InnoDB_redo_log_thread.png)
+
+参考资料
+
+[MySQL 8.0.11Source Code Documentation: Format of redo log](https://dev.mysql.com/doc/dev/mysql-server/8.0.11/PAGE_INNODB_REDO_LOG_FORMAT.html)
+
+[MySQL 8.0: New Lock free, scalable WAL design](https://mysqlserverteam.com/mysql-8-0-new-lock-free-scalable-wal-design/)
+
+[How InnoDB handles REDO logging](https://www.percona.com/blog/2011/02/03/how-innodb-handles-redo-logging/)
+
+## LinkBuf
+
+在MySQL8.0中增加了一个新的无锁数据结构Link_buf，主要用于redo log buffer以及buffer pool的flush list。
+
+这个数据结构简单来看就是一个拥有固定大小的数组，而对于InnoDB使用来说里面保存的就是写入redo log buffer或者加入到flush list的数据的大小，数组的每个元素可以被原子的更新。
+
+由于在MySQL 8.0中redo log buffer会有空洞，因此linkbuf用来track当前log buffer的写入情况，也就是说每次写入的数据大小都会保存在linkbuf中，而每次写入的位置通过start lsn来得到（hash），假设有空洞（某些lsn还没有写入），那么其对应在linkbuf中的值就是0，这样就可以很简单的track空洞。
+
+最后要注意的是这个数据结构的前提就是LSN是一直增长且不会重复的，因此在InnoDB中只在redo log和flush list（oldest LSN序）中使用。
+
+**源码分析**
+
+无锁ring buffer数据结构
+
+~~~~
+template <typename Position = uint64_t>
+class Link_buf {
+ public:
+  typedef Position Distance;          // 累计保存
+.....................................
+  */** Capacity of the buffer. */*
+  size_t m_capacity;                  // linkbuf的大小
+ 
+  */** Pointer to the ring buffer (unaligned). */*
+  std::atomic<Distance> *m_links;     // 保存的内容（动态数组，元素是每次写入的长度）
+ 
+  */** Tail pointer in the buffer (expressed in original unit). */*
+  alignas(INNOBASE_CACHE_LINE_SIZE) std::atomic<Position> m_tail; // 目前ring buffer的尾部（即第一个空洞的位置，保证之前都是连续的）
+};
+~~~~
+
+ctor
+
+根据传递进来的capacity,创建对应大小的数组(m_links)，然后初始化数组的内容（每个slot设为0）
+
+~~~~
+template <typename Position>
+Link_buf<Position>::Link_buf(size_t capacity)
+    : m_capacity(capacity), m_tail(0) {
+  if (capacity == 0) {
+    m_links = nullptr;
+    return;
+  }
+ 
+  ut_a((capacity & (capacity - 1)) == 0);
+ 
+  m_links = UT_NEW_ARRAY_NOKEY(std::atomic<Distance>, capacity);
+ 
+  for (size_t i = 0; i < capacity; ++i) {
+    m_links[i].store(0);
+  }
+}
+~~~~
+
+添加
+
+add_link函数保存这次的写入信息(mlog)：计算写入的起始点+长度（按照长度计算slot，slot = hash(len)）
+
+~~~~
+template <typename Position>
+inline void Link_buf<Position>::add_link(Position from, Position to) {
+  ut_ad(to > from);
+  ut_ad(to - from <= std::numeric_limits<Distance>::max());
+ 
+  const auto index = slot_index(from);
+ 
+  auto &slot = m_links[index];
+ 
+  ut_ad(slot.load() == 0);
+ 
+  slot.store(to - from);
+}
+~~~~
+
+计算slot
+
+计算方式很简单，起始点和数组的大小取模：
+
+~~~~
+template <typename Position>
+inline size_t Link_buf<Position>::slot_index(Position position) const {
+  return position & (m_capacity - 1);
+}
+~~~~
+
+判断空间
+
+has_space函数就是用来判断对应的position是否已经被占据：插入点是否大于尾部+整个空间大小是否overlap（贪吃蛇）
+
+~~~~
+template <typename Position>
+inline bool Link_buf<Position>::has_space(Position position) const {
+  return tail() + m_capacity > position;
+}
+~~~~
+
+更新尾部
+
+~~~~
+template <typename Position>
+template <typename Stop_condition>
+bool Link_buf<Position>::advance_tail_until(Stop_condition stop_condition) {
+  auto position = m_tail.load();
+ 
+  while (true) {
+    Position next;
+ 
+    bool stop = next_position(position, next);
+ 
+    if (stop || stop_condition(position, next)) {
+      break;
+    }
+ 
+    */* Reclaim the slot. */*
+    claim_position(position);
+ 
+    position = next;
+  }
+ 
+  if (position > m_tail.load()) {
+    m_tail.store(position);
+ 
+    return true;
+ 
+  } else {
+    return false;
+  }
+}
+~~~~
+
+读取position位置的slot内容（数据长度），返回下一个位置（next），并判断是否达到空洞（slot未设置，distince == 0）
+
+~~~~
+template <typename Position>
+bool Link_buf<Position>::next_position(Position *position*, Position &*next*) {
+  const auto index = slot_index(position);
+ 
+  auto &slot = m_links[index];
+ 
+  const auto distance = slot.load();
+ 
+  ut_ad(position < std::numeric_limits<Position>::max() - distance);
+ 
+  next = position + distance;
+ 
+  return distance == 0;
+}
+~~~~

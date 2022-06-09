@@ -108,7 +108,7 @@ change buffer bitmap中保存的针对每个页的bitmap中位信息如下：
 | :------------------- | :----- | :----------------------------------------------------------- |
 | IBUF_BITMAP_FREE     | 2      | 记录UNSI leaf page的剩余空间                                 |
 | IBUF_BITMAP_BUFFERED | 1      | 该页是否已被chagne buffer cache，用于物理读NUSI leaf page后判断是否需要merge |
-| IBUF_BITMAP_IBUF     | 1      | 该页是否为change buffer page                                 |
+| IBUF_BITMAP_IBUF     | 1      | 该页是否为change buffer page，<font color=red>主要用于异步IO（ibuf_thread）的读操作（ibuf_page_low）</font> |
 
 其中IBUF_BITMAP_FREE表示的剩余空间含义为：
 
@@ -218,3 +218,46 @@ if (op == IBUF_OP_INSERT) {
   - ACTIVE：5% io_capacity
 - slow shutdown，全部merge（srv_master_do_shutdown_tasks）
 - flush table：flush table xxx for export/with read lock; 表级别merge 
+
+# 死锁
+
+change buffer的最大挑战是对死锁的处理。之前我们介绍过，当我们将辅助索引页从磁盘读取到buffer pool中是，需要进行change buffer的merge，而merge可能会引起ibuf tree的收缩。因此需要持有相应的latch进行并发控制：
+
+![InnoDB_change_buffer_deadlock_ibuf_latch](/InnoDB_change_buffer_deadlock_ibuf_latch.png)
+
+需要持有fsp x-latch是因为b+树索引发生合并时需要对文件存储模块进行整理。但在之前介绍过的B+树索引中，获得latch的顺序如下：
+
+![InnoDB_change_buffer_deadlock_B+tree_latch](/InnoDB_change_buffer_deadlock_B+tree_latch.png)
+
+latch的规定顺序如下：
+
+~~~~
+enum latch_level_t {
+    ...
+    SYNC_FSP_PAGE,
+    SYNC_FSP,
+    SYNC_TREE_NODE,
+    SYNC_TREE_NODE_FROM_HASH,
+    SYNC_TREE_NODE_NEW,
+    SYNC_INDEX_TREE,
+    ...
+};
+~~~~
+
+如果将change buffer作为一颗普通的B+树来对待，将会导致死锁。
+
+还有一种情况也会导致change buffer产生死锁：所有的I/O线程都在异步读取操作，读取到的都是辅助索引页并且都需要进行change Buffer的合并，那么这时候将没有空闲的I/O线程处理对于change Buffer树的读取操作，从而导致死锁。
+
+通过上面的介绍可以发现，change buffer对于锁的层次设计才是其难点与技巧所在。为了避免上述死锁情况发生，InnoDB将页逻辑的分为三个层次（level）：
+
+- 非change buffer页
+- 除change buffer bitmap页之外的change buffer页，包括change buffer索引内存对象的latch，change buffer页的latch
+- change buffer bitmap页
+
+当持有某层的latch时不得持有其上层的latch。这就意味着，在处理change buffer对象时，fsp模块相关的latch的优先级要高于Insert Buffer索引树的latch！！！既然fsp模块相关的latch要比索引树的latch优先级要高，那么处理B+树索引的合并与扩展就要与普通索引树不同。
+
+Insert Buffer索引拥有自己的存储管理，可以发现在Insert Buffer索引的root页中存在free list链表。这样的设计可以使得Insert Buffer在合并与扩展时不需要通过fsp相关模块的latch保护，从而使得fsp模块的latch优先级可以高于Insert Buffer的设计。图11-4显示了在InnoDB引擎中，普通B+树索引（也就是用户表）与Insert Buffer的B+树索引树在文件空间管理上的不同：
+
+普通的B+树索引其root页保存有非叶子节点段的段头（segment header）信息和叶子节点段头。B+树索引操作是自上往下，自左往右进行加锁。当需要进行存储空间的扩展与收缩操作时，通过持有fsp模块的相关latch进行操作。这就是图11-3中显示的latch顺序。
+
+Insert Buffer虽然也是B+树索引，但是其只有一个段，段头保存在独立的页中（Insert Buffer header page）。另外其有独立的文件空间管理，Insert Buffer段所申请到的页都保存在root页的free list链表中。当需要进行B+树的扩展或收缩时，首先通过判断Insert Buffer的root页中的freelist链表是否有足够的空闲页。这样的设计使得在操作Insert Buffer索引树时不需要持有fsp模块的相关latch，只需要向free list链表中添加或删除页即可。也就是原fsp模块的相关latch与Insert Buffer索引树的相关存储操作分离，即之前所说的fsp模块的latch优先级高于Insert Buffer相关对象的情况，从而避免死锁问题的产生。

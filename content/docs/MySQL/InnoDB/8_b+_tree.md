@@ -1055,7 +1055,7 @@ btr_cur_optimistic_insert(
 6. 向页中插入记录（page_cur_tuple_insert）
 7. 更新AHI
 8. 不包含BTR_NO_LOCKING_FLAG，更新锁信息（lock_update_insert）
-9. 最后若插入的对象是插入缓冲时（插入缓冲本身也是一棵B+树），更新对应插入缓冲位图页中的信息。
+9. <font color=red>最后若插入的对象是插入缓冲时（插入缓冲本身也是一棵B+树），更新对应插入缓冲位图页中的信息。</font>
 10. 函数执行完成后，会释放持有页的x-latch，如果还有行溢出数据（big_rec），则还要对index和leaf page加x-latch，再将溢出的列数据存放到over-flow page中（btr_store_big_rec_extern_fields）。
 
 ### 悲观插入
@@ -1079,12 +1079,14 @@ btr_cur_optimistic_insert(
    非root page插入（btr_page_split_and_insert）
 5. 更新AHI（btr_search_update_hash_on_insert）
 6. 不包含BTR_NO_LOCKING_FLAG，更新锁信息（lock_update_insert）
-7. 最后若插入的对象是插入缓冲时（插入缓冲本身也是一棵B+树），更新对应插入缓冲位图页中的信息。
+7. <font color=red>最后若插入的对象是插入缓冲时（插入缓冲本身也是一棵B+树），更新对应插入缓冲位图页中的信息。</font>
 8. 函数执行完成后，会释放持有页的x-latch，如果还有行溢出数据（big_rec），则还要对index和leaf page加x-latch，再将溢出的列数据存放到over-flow page中（btr_store_big_rec_extern_fields）。
 
 ## 更新记录
 
-和插入操作一样，更新分为非主键更新和主键更新两个场景。这是因为，node pointer在clustered index和secondary index所存储的key是不同的。
+和插入操作一样，更新分为非主键更新和主键更新两个场景。这是因为，node pointer在clustered index和secondary index所存储的key是不同的，其leaf层存储的data也是不一样的。
+
+secondary index上没有存储多版本信息，因此secondary index的更新，需要delete mark+insert，并通过clustered index维护update vector和index columns，来存储变化的delta。
 
 ### 非主键更新
 
