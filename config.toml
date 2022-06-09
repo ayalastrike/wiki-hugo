@@ -59,3 +59,4 @@ endLevel = 6
   # Can be overwritten by same param in page frontmatter
   BookComments = true
 
+  disqusShortname = 'ricktian'
