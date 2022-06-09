@@ -22,7 +22,7 @@ endLevel = 6
 # [[menu.before]]
 [[menu.after]]
   name = "About"
-  url = "about"
+  url = "/about"
   weight = 10
 
 [params]

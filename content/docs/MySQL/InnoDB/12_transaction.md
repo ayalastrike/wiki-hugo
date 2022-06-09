@@ -610,7 +610,6 @@ InnoDB内部定义了三种回滚类型
   - 从update_undo中解析出update vector回退seconary index：去除delete mark标记，或者用update vector中的diff信息修改成之前的值（row_undo_mod_del_unmark_sec_and_undo_update）
   - 同样用update vector中的diff信息修改clustered index（row_undo_mod_clust）
 
-
 总结一下，逆向操作可以分为以下几种：
 
 - delete mark = 1改为0
@@ -631,6 +630,8 @@ InnoDB内部定义了三种回滚类型
 当执行DDL，或者采用事务控制语句（BEGIN，START TRANSACTION时），为隐式提交。
 
 显式提交，发送COMMIT。
+
+
 
 另外，MySQL因为架构分为server层和engine层，为了保证两层日志的一致性，
 
