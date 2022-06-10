@@ -33,7 +33,17 @@ SQL和SQL2标准的默认事务隔离级别是Serializable。
 
 InnoDB支持的默认事务隔离级别是Repeatable Read，但是和SQL标准不同的是，InnoDB在此隔离级别下，通过使用next-key locking算法，避免了幻读的产生，即可以完全保证事务的隔离性要求，达到了SQL标准的Serializable隔离级别。在append-only storage上，采用snapshot isolation也是避免幻读的一种实现方式。
 
-关于事务可以洋洋洒洒写很多，这里主要聚焦InnoDB中的事务子系统的实现，详细事务的概念和事务控制技术这里略过。
+{{< hint danger>}}
+
+这里给读者留一个扩展性的思考：
+
+采用MV可以实现snapshot isolation进而避免幻读吗？
+
+InnoDB既然也有采用了MV，不用next-key locking而用Percolator的方式能不能做到？
+
+{{</hint>}}
+
+关于事务可以洋洋洒洒写很多，这里主要聚焦InnoDB中的事务子系统的实现，详细的事务概念和事务控制技术这里略过。
 
 # 2 事务子系统
 
@@ -625,21 +635,202 @@ InnoDB内部定义了三种回滚类型
 
 ## 4.2 commit
 
+事务的提交核心注意两个点位：commit point和complete point。
+
 事务提交分为两种：隐式提交和显式提交。
 
 当执行DDL，或者采用事务控制语句（BEGIN，START TRANSACTION时），为隐式提交。
 
 显式提交，发送COMMIT。
 
+另外，MySQL支持XA事务，这里我们只谈内部XA事务。
 
+### 4.2.1 内部XA事务
 
-另外，MySQL因为架构分为server层和engine层，为了保证两层日志的一致性，
+MySQL因为架构分为server层和engine层，为了保证两层日志的一致性，需要使用2PC原子协议，而这通过内部XA事务保证。
 
-事务提交时，为了和server层的binlog做XA，InnoDB的commit分为2个阶段（2PC）：
+采用2PC，就要有协调者（Coordinator），而协调者可以有三种：
+
+- mysql_bin_log：开启binlog，至少一个支持事务的存储引擎，使用binlog记录事务状态，称为Binlog/Engine XA
+- tc_log_mmap：不开binlog，至少两个支持事务的存储引擎，使用内存记录事务状态，称为Engine/Engine XA
+- tc_log_dummy：不开binlog，即只有InnoDB或其他，事务状态下沉到engine中，称为Engine Commit
+
+选择协调者的具体逻辑代码如下：在MySQL启动时进行判断：
+
+~~~~
+init_server_components() {
+  ...
+  if (total_ha_2pc > 1 || (1 == total_ha_2pc && opt_bin_log))
+  {
+    if (opt_bin_log)
+      tc_log= &mysql_bin_log;
+    else
+      tc_log= &tc_log_mmap;
+  }
+  ...
+}
+~~~~
+
+存储引擎是否支持事务（total_ha_2pc）判断如下：
+
+~~~~
+int ha_initialize_handlerton(st_plugin_int *plugin) {
+	if (hton->prepare)
+    total_ha_2pc++;
+}
+~~~~
+
+提供的XA命令（接口）：
+
+- XA start：open()
+- XA end：close()
+- XA rollback：rollback()
+- XA prepare：prepare()
+- XA commit：commit()
+
+各个具体的协调者则实现这些接口。
+
+tc_log_dummy直接调用下发到engine层（调用engine的rollback, prepare, commit），而另2种协调者则需要做具体的事情，具体区别如下：
+
+|               | prepare        | commit                       | rollback        |
+| ------------- | -------------- | ---------------------------- | --------------- |
+| mysql_bin_log | ha_prepare_low | write binlog + ha_commit_low | ha_rollback_low |
+| tc_log_mmap   | ha_prepare_low | write XID + ha_commit_low    | ha_rollback_low |
+| tc_log_dummy  | ha_prepare_low | ha_commit_low                | ha_rollback_low |
+
+其中ha_prepare_low，ha_commit_low，ha_rollback_low都是调用存储引擎注册的prepare，commit和rollback。
+
+从上面可以看到，对于协调者是binlog和mmap时，都需要支持2PC，2PC是否支持（m_no_2pc）的封装在TransactionContext中的THD_TRANS对象中：
+
+~~~~
+class Transaction_ctx
+{
+...
+private:
+  struct THD_TRANS
+  {
+    /* true is not all entries in the ht[] support 2pc */
+    bool        m_no_2pc;
+    int         m_rw_ha_count;
+    /* storage engines that registered in this transaction */
+    Ha_trx_info *m_ha_list;
+~~~~
+
+每个事务在存储引擎注册时设置该值：
+
+~~~~
+trans_register_ha() {
+  if (ht_arg->prepare == 0)
+    trn_ctx->set_no_2pc(trx_scope, true);
+}
+~~~~
+
+在事务推进过程中标记读写：
+
+~~~~
+mark_trx_read_write
+  ha_info->set_trx_read_write();
+    m_flags|= (int) TRX_READ_WRITE;
+~~~~
+
+并在事务提交时计算是否真正需要2PC：
+
+~~~~
+ha_commit_trans() {
+  if (ha_info)
+  {
+    uint rw_ha_count;
+    rw_ha_count= ha_check_and_coalesce_trx_read_only(thd, ha_info, all);
+      for loop in ha_list:
+        if (ha_info->is_trx_read_write())
+          ++rw_ha_count;
+    trn_ctx->set_rw_ha_count(trx_scope, rw_ha_count);
+~~~~
+
+### 4.2.2 Binlog/Engine XA
+
+在这里我们聚焦在支持2PC且协调者为mysql_bin_log。
+
+在这种场景下，TM为mysql_bin_log，RM为binlog engine和InnoDB engine。结合MySQL的架构可以看出，TM在server层，RM在engine层。
+
+#### 事务协调机制
+
+这样，在XA事务中，就需要有通信机制确认是否进行两阶段提交（2PC）：
+
+1. 注册事务：即上面的trans_register_ha，InnoDB会在innobase_register_trx中调用
+2. 标记发生事务读写：在server层的handler调用时标记
+3. 提交时判断标记，即ha_commit_trans()
+
+其中InnoDB engine注册的接口为：
+
+~~~~
+innobase_hton->commit = innobase_commit;
+innobase_hton->rollback = innobase_rollback;
+innobase_hton->prepare = innobase_xa_prepare;
+innobase_hton->recover = innobase_xa_recover;
+innobase_hton->commit_by_xid = innobase_commit_by_xid;
+innobase_hton->rollback_by_xid = innobase_rollback_by_xid;
+~~~~
+
+binlog engine注册的接口为：
+
+~~~~
+binlog_hton->commit= binlog_commit;
+binlog_hton->commit_by_xid= binlog_xa_commit;
+binlog_hton->rollback= binlog_rollback;
+binlog_hton->rollback_by_xid= binlog_xa_rollback;
+binlog_hton->prepare= binlog_prepare;
+binlog_hton->recover=binlog_dummy_recover;
+~~~~
+
+标记发生事务读写的地方：
+
+~~~~
+handler::ha_bulk_update_row
+handler::ha_write_row
+handler::ha_update_row
+handler::ha_delete_row
+handler::ha_delete_all_rows()
+handler::ha_truncate()
+handler::ha_rename_table
+handler::ha_delete_table
+handler::ha_drop_table
+handler::ha_create
+...
+~~~~
+
+#### 2PC
+
+2PC协议不再详述。这里只说几个key point：
+
+1. commit point：因为TM是binlog，因此事务成功的标志是binlog写入成功
+2. forward recovery：过了commit point，即XID在binlog里的，commit
+3. backwared recovery：没过commit point，即XID不在binlog里的，rollback
+4. complete point：事务完全完成
+
+因此，两阶段核心做的事情就清晰了：
+
+- prepare：
+  - binlog：no-op
+  - InnoDB：undo中标记事务状态prepared，记XID，以上都包裹在redo log中，redo log持久化
+- commit
+  - binlog：写XID binlog，sync binlog，记commit point
+  - InnoDB：InnoDB commit，记complete point（history链表，undo slot，释放资源）
+
+从这里也可以看出，redo包住undo，commit point一定要redo先binlog后，complete point一定要redo log在最后。
+
+{{< hint danger>}}
+
+这里留给读者1个问题：binlog中一定会有XID吗？更进一步，数据操作一定会有XID吗？
+
+{{</hint>}}
+
+两阶段提交中InnoDB的细节如下：
 
 - prepare：
   - 将事务状态从active->prepared，即将所有undo slot中的undo segment page的seg_hdr.TRX_UNDO_STATE=TRX_UNDO_PREPARED（trx_undo_set_state_at_prepare）
-  - 填充XID（执行事务的第一条SQL时，就会注册XA，并根据thd->query_id分配XID）（trans_register_ha）
+  - 在事务的undo log header中填充XID（执行事务的第一条SQL时，就会注册XA，并根据thd->query_id分配XID）（trans_register_ha）
+  - redo log持久化
 - commit：
   - 将所有undo slot设为完成态（CACHED/TO_FREE/TO_PURGE）
     - 如果undo segment iff 1 undo page && 使用量小于3/4，复用该undo segment（将该undo segment状态设为TRX_UNDO_CACHE）
@@ -654,7 +845,7 @@ InnoDB内部定义了三种回滚类型
   - flush redo log buffer（WAL）
   - 将trx从事务列表中删除
 
-redo log中并没有一个"特殊"的redo log record表示事务结束：事务结束的标志是事务的undo log放入rollback segment的history链表。这个操作将redo log写入mtr中，mtr.commit后在事务提交时flush redo log buffer完成。
+redo log中并没有一个"特殊"的redo log record表示事务结束（complete point）：事务结束的标志是事务的undo log放入rollback segment的history链表。这个操作将redo log写入mtr中，mtr.commit后在事务提交时flush redo log buffer完成。
 
 调用链如下：
 
@@ -674,6 +865,45 @@ trx_commit_low
 
 {{</hint>}}
 
+#### group commit
+
+在MySQL 5.6之前，每次2PC都是串行的，即上一个事务prepare+commit完成后，下一个事务才能开始。
+
+从上面的2PC我们可以知道，其中会发生3次IO，redo log, binlog,  redo log，这极大的影响了事务处理的性能。
+
+在MySQL 5.6中，引入了binlog的group commit，即prepare阶段不变，commit阶段变为3个（ordered_commit）：
+
+1. flush stage：各个用户线程按序从thd合入binlog文件
+2. sync stage：对binlog做fsync
+3. commit stage：各个用户线程按序做InnoDB commit
+
+每个stage都有一个队列，第一个进入队列的thd为leader，后续进入的线程为follower阻塞并等待该stage完成。leader负责领导队列中的所有线程执行该stage所要进行的工作，并带领所有follower进入下一个stage。
+
+这三个阶段类似于CPU执行指令的pipeline一样，并发执行，从而提升commit效率。
+
+有两个参数控制group的形成：
+
+- 时间：binlog_group_commit_sync_delay (μs)
+- 空间：binlog_group_commit_sync_no_delay_count=N
+
+MySQL 5.7继续优化，将prepare中InnoDB写redo log delay到group commit阶段：这是因为prepare阶段的IO，即每个用户线程的redo log sync成为了瓶颈，
+
+于是，redo log sync移到了commit阶段的flush stage：
+
+1. 排队，确认leader和follower
+2. (+) leader线程进行redo log write+sync，一次性将所有线程的redo log持久化（ha_flush_logs）
+3. 各个用户线程按序从thd合入binlog文件
+
+即redo log delay（不会破坏正确性，因为redo log持久化还是在binlog持久化之前），redo log group commit。
+
+{{< hint info>}}
+
+这里注意binlog_order_commits，其控制binlog和InnoDB提交同序，在单机下不会有问题，因为一致性靠XID保证，但是如果备份使用xtrabackup工具，其依赖trx_sys page上记录的binlog点位，如果位点发生乱序，就会导致备份的数据不一致。
+
+{{</hint>}}
+
+这里稍微提一句，MGR中的Paxos在写binlog前（commit point之前）各个用户线程单独进行Group Replication，成功才写binlog，否则直接回滚事务。
+
 ## 4.3 MVCC
 
 从前面的undo chain图上可以很直观的看到，undo记录包含了行数据的历史版本，因此，MVCC可以：
@@ -690,6 +920,12 @@ trx_commit_low
 - trx_sys->rw_trx_ids：当前active的读写事务列表，开启读写事务时加入，读写事务提交时移除
 
 以及基于以上构建readview
+
+{{< hint info>}}
+
+MySQL 5.6将事务列表拆分为只读事务列表和读写事务列表
+
+{{</hint>}}
 
 读写异常是因为本事务的R和其他事务的R+W有交集，MVCC也是本着这个本质来解决问题的，解决问题的核心是定序。
 
@@ -736,6 +972,12 @@ readview由以下几部分构成：
 ![InnoDB_txn_MVCC](/InnoDB_txn_MVCC.png)
 
 这里要理解insert_undo为什么事务提交后可以抛弃，readview的遍历方式。
+
+{{< hint danger>}}
+
+这里留给读者2个问题：prepared的事务可见吗？如何理解commit point、complete point和MVCC之间的关系？
+
+{{</hint>}}
 
 ### 4.3.3 构建版本
 
@@ -846,11 +1088,11 @@ crash recovery的恢复分为两个阶段：
 
 1. forward，恢复到内存态，即将redo log从checkpoint到最新，进行apply，将磁盘上的数据恢复到crash时的内存态，其中也包括undo log。
 
-2. backward：因为buffer pool的STEAL+NO-FORCE，需要将active STEAL的数据rollback掉，即找出活跃事务，将其rollback，也称为failure atomic。
+2. backward：因为buffer pool的STEAL+NO-FORCE，需要将active STEAL的数据rollback掉，即找出active+prepared事务，将其rollback，也称为failure atomic。
 
    具体来讲，遍历所有rollback segment，读取其undo segment中的undo segment page中TRX_UNDO_STATE，可以得知其事务状态（还记得前面说过的吗，一个undo segment只会最多有一个active transaction），如果为活跃事务，则需要遍历该事务的undo来rollback，以及构建出事务子系统的内存布局：trx_sys，trx_t，trx_rseg_t和trx_undo_t
 
-这里还需要考虑XA事务，即保证server层的binlog和InnoDB数据的一致，通过2PC我们可以知道，只要过了commit point，就可以forward。这样，我们就可以通过判断binlog是否已经记录（扫描最后一个binlog文件，拿binlog的XID和InnoDB的XID做比对，如果binlog有，则提交InnoDB事务，否则回滚InnoDB事务）。
+这里还需要考虑XA事务。
 
 总结一下，数据库系统整体的恢复节奏如下：
 
