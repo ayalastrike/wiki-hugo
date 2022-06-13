@@ -4,9 +4,9 @@ typora-copy-images-to: ../../../../static
 title: transaction
 ---
 
-# 1 事务
+# 事务
 
-## 1.1 概述
+## 概述
 
 事务是访问数据库中数据的一个程序执行单元。在一个事务中的操作，要么都做，要么不做，这是事务的目的，也是事务模型区别于文件系统的重要特征之一。
 
@@ -14,11 +14,11 @@ title: transaction
 
 这里要注意，D保证的是事务系统的高可靠性（High Reliability），而不是高可用性（High Availability）。对于高可用性，事务本身并不能保证，需要一些系统共同配合来完成。
 
-## 1.2 分类
+## 分类
 
 参见Jim Gray
 
-## 1.3 隔离级别
+## 隔离级别
 
 令人惊讶的是，大部分数据库系统都没有提供真正的隔离性，最初或许是因为系统实现者并没有真正理解这些问题。如今这些问题已经弄清楚了，但是数据库的实现者在正确性和性能之间做了妥协。ISO和ANSI SQL标准制定了四种事务隔离级别的标准，但是很少有数据库厂商遵循这些标准，比如Oracle不支持Read Uncommitted和Repeatable Read的事务隔离级别。
 
@@ -45,7 +45,7 @@ InnoDB既然也有采用了MV，不用next-key locking而用Percolator的方式�
 
 关于事务可以洋洋洒洒写很多，这里主要聚焦InnoDB中的事务子系统的实现，详细的事务概念和事务控制技术这里略过。
 
-# 2 事务子系统
+# 事务子系统
 
 事务子系统中的数据包括事务信息、undo log、binlog信息以及doublewrite信息。
 
@@ -81,7 +81,7 @@ trx_sys page:
 
 {{</hint>}}
 
-## 2.1 trx_sys page
+## trx_sys page
 
 事务系统段在InnoDB第一次启动时创建（trx_sysf_create），trx_sys segment header保存在系統表空間的(0, 5)位置，该页称为trx_sys page，保存以下事务信息：
 
@@ -104,7 +104,7 @@ TRX_SYS_MYSQL_LOG_INFO保存server层的binlog信息（-1000），用以保证in
 
 TRX_SYS_DOUBLEWRITE保存了doublewrite信息（-200）。
 
-## 2.2 doublewrite segment
+## doublewrite segment
 
 在buffer pool一章已经介绍，InnoDB在flush page时，为了避免partial-write，而采用doublewrite的方式进行flush，其本质上使用的是shadow page+duplex replica的方式。
 
@@ -185,9 +185,9 @@ for (i = 0; i < 2 * TRX_SYS_DOUBLEWRITE_BLOCK_SIZE
 
 从这里可以看出，一共申请了64 * 2 +32个页（2 * TRX_SYS_DOUBLEWRITE_BLOCK_SIZE + FSP_EXTENT_SIZE / 2），这正如前面所分析的，doublewrite segment需要保证写入的顺序性。
 
-# 3 undo log
+# undo log
 
-## 3.1 设计
+## 设计
 
 在InnoDB中，undo log有两个用途：
 
@@ -222,7 +222,7 @@ undo log的组织有几个维度：
 
 接下来，通过从总体到局部的顺序，依次介绍rollback segment→undo segment→undo page→undo log。
 
-## 3.2 物理布局
+## 物理布局
 
 undo log的存储由rollback segment和undo segment共同完成,，并且，这两个段的segment header都保存在各自的segment内。rollback segment中仅保存undo segment page所在页的位置，一个rollback segment一共保存1024个undo segment的信息，加上trx_sys page可以保存128个rollback segment slot，因此理论上可以支持最大128 * 1024/2个并发事务（因为同一时刻只能有一个active事务使用一个undo page，假定每个事务DML有INSERT、UPDATE、DELETE）。
 
@@ -232,7 +232,7 @@ undo log的存储由rollback segment和undo segment共同完成,，并且，这�
 
 
 
-### 3.2.1 rollback segment
+### rollback segment
 
 trx_sys page描述了128个rollback segment的信息（space+page_no）。这128个rollback segment保存在rollback segment header page中，其中RSEG_0 page位于(0, 6)位置。
 
@@ -256,7 +256,7 @@ trx_sys page描述了128个rollback segment的信息（space+page_no）。这128
 
 在MySQL 5.7中，REG_0在系统表空间中，REG_1 ~ REG_32在临时表空间，REG_33 ~ REG_127如果配置了undo表空间（space_id固定，从1开始）则放置其内，否则在系统表空间。
 
-### 3.2.2 undo segment
+### undo segment
 
 每个rollback segment描述了1024个undo segment page，其中每个undo segment又由一系列undo page组成，存储实际的undo log，因此undo segment可以认为是一个"逻辑概念"，由一组undo page构成。
 
@@ -269,7 +269,7 @@ trx_sys page描述了128个rollback segment的信息（space+page_no）。这128
 | TRX_UNDO_FSEG_HEADER | 10   | undo segment header                                          |
 | TRX_UNDO_PAGE_LIST   | 16   | undo page链表（将同一事务的segment page和normal page串在一起） |
 
-### 3.2.3 undo page
+### undo page
 
 undo segment中的所有page都为undo page，都有undo page header（18字节）：
 
@@ -332,7 +332,7 @@ trx_undo_set_state_at_finish() {
 }
 ~~~~
 
-### 3.2.3 undo log
+### undo log
 
 undo log是一种逻辑日志，存储的是记录修改的before image（前镜像）。因此事务的rollback意味着是将数据逻辑的恢复到原来的样子。
 
@@ -376,7 +376,7 @@ undo log header之后存放实际的undo log record。
 
 ![InnoDB_txn_undo_log_detail](/InnoDB_txn_undo_log_detail.png)
 
-#### 3.2.3.1 insert undo log record
+#### insert undo log record
 
 insert undo log record通常是指事务在INSERT操作中产生的undo日志。因为insert操作的记录只对事务本身可见，对其他事务不可见（没有历史版本），因此可以在事务提交后直接删除，不需要进行purge操作。
 
@@ -388,7 +388,7 @@ insert undo log的结构：
 
 rollback时根据key fields在index中定位record
 
-#### 3.2.3.2 update undo log record
+#### update undo log record
 
 update undo log record通常保存的是对DELETE和UPDATE操作产生的undo日志。该undo日志可能需要提供MVCC机制，因此与insert undo log record不同，其不能在事务提交时立即进行删除。当事务提交时，它会放入rollback segment的history链表的头部。然后等待purge。
 
@@ -447,7 +447,7 @@ INSERT INTO t values (1, 'm');
 
 从这里可以发现，insert操作不一定都产生insert update undo log，也可能产生TRX_UNDO_UPD_DEL_REC类型的update undo log record。另外，在这个例子中，第二次插入的并非是主键值=1的记录，或者之后插入的记录的字节大小发生了变化，那么就不会产生TRX_UNDO_UPD_DEL_REC的undo日志，其产生的依旧是insert update undo log。
 
-### 3.2.4 undo的redo
+### undo的redo
 
 在前面已经提到，undo的持久化要通过redo保证，因此undo也有对应的redo log type：
 
@@ -458,7 +458,7 @@ INSERT INTO t values (1, 'm');
 - MLOG_UNDO_HDR_REUSE：复用undo log header
 - MLOG_UNDO_HDR_CREATE：创建undo log header
 
-## 3.3 内存布局
+## 内存布局
 
 在事务子系统中，undo的管理非常重要，我们在上面介绍了物理布局，在内存中，也需要构建其对应的内存对象，来进行undo管理。
 
@@ -497,7 +497,7 @@ struct trx_rseg_t {
 
 ![InnoDB_txn_undo_memory_layout](/InnoDB_txn_undo_memory_layout.png)
 
-## 3.4 undo的一生
+## undo的一生
 
 我们从整个undo的生命周期来完整系统的介绍：
 1. 分配rollback segment
@@ -505,7 +505,7 @@ struct trx_rseg_t {
 3. 写入undo log
 4. 事务提交，事务回滚，MVCC，purge，crash recovery在事务一节介绍
 
-### 3.4.1 分配rollback segment
+### 分配rollback segment
 
 当事务"产生"对数据进行修改时，会相应产生undo log。也就是说，rollback segment在事务第一次"需要"存储undo log时才分配。
 
@@ -537,7 +537,7 @@ trx_set_rw_mode   设置为读写事务
     rseg = get_next_redo_rseg(max_undo_logs, n_tablespaces);
 ~~~~
 
-### 3.4.2 使用rollback segment
+### 使用rollback segment
 
 流程如下（trx_undo_report_row_operation）：
 
@@ -562,7 +562,7 @@ trx_set_rw_mode   设置为读写事务
 
 {{</hint>}}
 
-### 3.4.3 写入undo log record
+### 写入undo log record
 
 写入undo log record流程如下（trx_undo_report_row_operation）：
 
@@ -571,13 +571,13 @@ trx_set_rw_mode   设置为读写事务
 3. 如果写入过程中空间不足，则将已写部分涂黑0xFF（trx_undo_erase_page_end），然后申请新的undo page重新写入
 4. 构建rollback pointer，并更新到clustered index record中
 
-# 4 事务
+# 事务
 
 大多数数据库采用STEAL+NO-FORCE的方式，在事务推进国产中，不断写入undo log，然后在事务提交时，保证redo log持久化到磁盘。这样，当发生被动故障时，就可以通过crash recovery将数据恢复到一致的状态。
 
-## 4.1 rollback
+## rollback
 
-### 4.1.1 rollback pointer
+### rollback pointer
 
 在record一章我们介绍过，行记录通过roll_ptr将行的历史变化串联起来，实现MV。
 
@@ -589,7 +589,7 @@ rollback pointer指针占用7个字节：undo segment no需要1个字节，且�
 
 ![InnoDB_txn_rollback_chain](/InnoDB_txn_rollback_chain.png)
 
-### 4.1.2 回滚操作
+### 回滚操作
 
 根据回滚操作的发起者来分类，可以分为用户态的回滚和内核态的回滚。
 
@@ -633,7 +633,7 @@ InnoDB内部定义了三种回滚类型
 
 回滚同样需要提交，因为与正常提交一样，需要释放事务所持有的资源：undo segment、lock、read view，并flush redo log buffer。
 
-## 4.2 commit
+## commit
 
 事务的提交核心注意两个点位：commit point和complete point。
 
@@ -645,7 +645,7 @@ InnoDB内部定义了三种回滚类型
 
 另外，MySQL支持XA事务，这里我们只谈内部XA事务。
 
-### 4.2.1 内部XA事务
+### 内部XA事务
 
 MySQL因为架构分为server层和engine层，为了保证两层日志的一致性，需要使用2PC原子协议，而这通过内部XA事务保证。
 
@@ -747,7 +747,7 @@ ha_commit_trans() {
     trn_ctx->set_rw_ha_count(trx_scope, rw_ha_count);
 ~~~~
 
-### 4.2.2 Binlog/Engine XA
+### Binlog/Engine XA
 
 在这里我们聚焦在支持2PC且协调者为mysql_bin_log。
 
@@ -904,7 +904,7 @@ MySQL 5.7继续优化，将prepare中InnoDB写redo log delay到group commit阶�
 
 这里稍微提一句，MGR中的Paxos在写binlog前（commit point之前）各个用户线程单独进行Group Replication，成功才写binlog，否则直接回滚事务。
 
-## 4.3 MVCC
+## MVCC
 
 从前面的undo chain图上可以很直观的看到，undo记录包含了行数据的历史版本，因此，MVCC可以：
 
@@ -931,7 +931,7 @@ MySQL 5.6将事务列表拆分为只读事务列表和读写事务列表
 
 只读事务的trx_id始终为0（不分配），读写事务分配trx_id，另外，readview都分配，
 
-### 4.3.1 readview
+### readview
 
 readview的生命周期：
 
@@ -959,7 +959,7 @@ readview由以下几部分构成：
 1. trx id < read_view::m_up_limit_id
 2. read_view::m_up_limit_id < trx id < read_view::m_low_limit_id，并且 trx id 不属于 trx_t::read_view::m_ids
 
-### 4.3.2 数据可见性
+### 数据可见性
 
 事务为T，trx_id为记录R中的DATA_TRX_ID：
 
@@ -979,7 +979,7 @@ readview由以下几部分构成：
 
 {{</hint>}}
 
-### 4.3.3 构建版本
+### 构建版本
 
 因为在clustered index的行上存储了trx_id和roll_ptr，因此可以通过trx_id判断可见性，如果不可见，则通过roll_ptr继续向前构建，直至可见或者达到尾部。（row_vers_build_for_consistent_read）。
 
@@ -995,13 +995,13 @@ undo log record如果是insert_undo，不用查看undo，因为未提取事务�
 
 {{</hint>}}
 
-## 4.4 purge
+## purge
 
 purge操作负责清理已提交的不再被使用的数据，包括记录和日志。
 
 清理这些数据依托于undo log，更进一步，依托于构建在提交序上的点位（trx_no），再结合SQL graph，展开实际的清理。
 
-### 4.4.1 清理操作
+### 清理操作
 
 purge清理属于事后打扫，这一方面保证forward fast，另一方面为了MVCC的GC，因此，清理工作包括：
 
@@ -1028,7 +1028,7 @@ purge的执行序列通过构建SQL execution graph来实现。
 
 并且，在进行purge操作时，会产生大量的随机读，这可能会产生性能问题。另外，如果出现了长事务正在使用mvcc（比如最新的active事务），则会导致history链表最头部的已提交事务的undo log的回收无法进行。
 
-### 4.4.2 purge实现
+### purge实现
 
 purge_sys全局对象（trx_purge_t）保存当前purge的位置和信息。
 
@@ -1082,7 +1082,7 @@ purge_is_running用于保护DROP TABLE的操作，当进行purge undo日志时�
 
 latch用于保证删除undo日志的正确性，保证删除时没有其他事务正在引用该undo日志。当开启purge操作时，首先需要持有该x-latch，然后通过read_view_oldest_copy_or_open_new判断哪些undo日志可以被清理（注意：purge是一个特殊的事务，事务类型为TRX_PURGE，其他都是用户事务）。当用户事务需要通过undo日志进行多版本并发控制（一致性非锁定读）时，需要首先获得该对象的s-latch。
 
-## 4.5 crash recovery
+## crash recovery
 
 crash recovery的恢复分为两个阶段：
 
