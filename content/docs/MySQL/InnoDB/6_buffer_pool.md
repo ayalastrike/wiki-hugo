@@ -58,6 +58,12 @@ PCB和其中的meta、frame（数据页）之间的关系如下图所示：
 
 从上面的内存布局可以看出，PCB中的第一个字段（必须）是meta，以保证page table指向的buf_block_t和buf_page_t两种类型的指针可以相互转换，block→frame指向真正存放数据的数据页。
 
+{{< hint info>}}
+
+现代操作系统在分配内存时也不会把"真正"的内存给用户，也是通过control block的方式进行管理的。
+
+{{</hint>}}
+
 meta中的元信息有：page size、state、oldest_modification、newest_modification、access_time...，对于压缩页，解压后的实际数据指针也是用frame指向。
 
 {{< hint danger>}}
@@ -123,9 +129,9 @@ buffer pool中的内存空间以页的倍数来申请，即以页为单位进行
 
 在InnoDB的LRU链表设计中（LRU-K），通过加入midpoint位点划分出老区（历史队列）和新区（缓冲区）。新读取到的页，虽然是最近访问的页，并不直接放到LRU链表的头部，而是放到midpoint的（默认3/8）位置，这种算法在InnoDB中称为midpoint insertion strategy。这样做而不采用朴素的LRU算法的原因，是因为某些低频但是数据量大的SQL操作或者预读可能会将缓冲池中频繁使用的页刷出（sequential flooding），从而影响缓冲池的效率。
 
-此外，有些页不属于数据页或索引页，从free链表申请，但使用完毕后，并不放入LRU链表，比如AHI，lock info。
+此外，有些页不属于数据页或索引页，从free链表申请，但使用完毕后，并不放入LRU链表，比如AHI，lock info等等。
 
-例如在下面的例子中，buffer pool - free - LRU = 65528 - 43916 - 21603 = 9，还缺少9个页，这些页其实分配给了AHI：
+比如，在下面的例子中，buffer pool - free - LRU = 65528 - 43916 - 21603 = 9，还缺少9个页，这些页其实分配给了AHI：
 
 ````
 ----------------------
@@ -528,12 +534,6 @@ flush后放入尾部，表示可以evict
 
 ![InnoDB_buffer_pool_LRU_list](/InnoDB_buffer_pool_LRU_list.png)
 
-
-
-
-
-![InnoDB_buffer_pool_LRU](/InnoDB_buffer_pool_LRU.png)
-
 LRU相关的函数调用链如下：
 
 ![InnoDB_buffer_pool_LRU_chain](/InnoDB_buffer_pool_LRU_chain.png)
@@ -685,6 +685,10 @@ buf_page_init_for_read(){
   return (bpage);
 }
 ~~~~
+
+从这里可以看出，对于页面的物理访问的并发保护如下图所示：
+
+![InnoDB_buffer_pool_fetch_page](/InnoDB_buffer_pool_fetch_page.png)
 
 这里注意两点：
 

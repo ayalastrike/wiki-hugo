@@ -83,10 +83,10 @@ page header中的字段含义如下：
 | PAGE_N_DIRECTION  | 2    | 一个方向上连续插入记录的数量                                 |
 | PAGE_N_RECS       | 2    | 页中用户记录的数量                                           |
 | PAGE_MAX_TRX_ID   | 8    | 修改当前页的TRX ID，仅在辅助索引和<font color=red>change buffer</font>中使用 |
-| PAGE_LEVEL        | 2    | 当前页在索引树中的位置，0x00代表叶子节点，即叶子节点总是在第0层（不变性），page_is_leaf |
+| PAGE_LEVEL        | 2    | 当前页在B+ tree中的层，0x00代表叶子节点，即叶子节点总是在第0层（不变性），page_is_leaf |
 | PAGE_INDEX_ID     | 8    | 索引ID，标识当前页属于哪个索引                               |
-| PAGE_BTR_SEG_LEAF | 10   | B+树叶子节点所在段的segment header，仅在B+树的root页中定义   |
-| PAGE_BTR_SEG_TOP  | 10   | B+树非叶子节点所在段的segment header，仅在B+树的root页中定义 |
+| PAGE_BTR_SEG_LEAF | 10   | B+ tree叶子节点所在段的segment header，仅在B+ tree的root页中定义 |
+| PAGE_BTR_SEG_TOP  | 10   | B+ tree非叶子节点所在段的segment header，仅在B+ tree的root页中定义 |
 
 PAGE_MAX_TRX_ID及之前的所有字段在页创建的时候时设置，其后的字段在填充具体数据时才设置。
 
@@ -127,7 +127,7 @@ page_dir_split_slot和page_dir_balance_slot用来保证每个槽所包含的记�
 
 在record中讲过，每个页都有2个伪记录，如图所示。在infimum记录和supremum记录之间的被称为用户记录（page_rec_is_user_rec_low）。因此在page header中用PAGE_N_HEAP和PAGE_N_RECS标识堆和页中的记录数量，PAGE_N_RECS表示一页上真实的记录数，PAGE_N_HEAP表示从HEAP上分配出去的记录数。
 
-![InnoDB_page-infimum_supremum_record](/InnoDB_page-infimum_supremum_record-2683587.png)
+![InnoDB_page-infimum_supremum_record](/InnoDB_page-infimum_supremum_record.png)
 
 在old-style和new-style行格式下，infimum和supremum记录稍有区别，如下图所示：
 

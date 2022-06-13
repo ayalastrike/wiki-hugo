@@ -61,10 +61,11 @@ MySQL的表级锁定最开始使用thr_lock，主要分为两种类型，一种�
 - waiting read/write
 
 如下：
-• Current read-lock queue (lock->read)
-• Pending read-lock queue (lock->read_wait)
-• Current write-lock queue (lock->write)
-• Pending write-lock queue (lock->write_wait)
+
+- Current read-lock queue (lock->read)
+- Pending read-lock queue (lock->read_wait)
+- Current write-lock queue (lock->write)
+- Pending write-lock queue (lock->write_wait)
 
 对于DQL，锁类型一般是TL_READ；对于普通的DML，是TL_WRITE_ALLOW_WRITE
 
@@ -132,7 +133,6 @@ MDL状态转换如下图所示：
 从当前线程开始，转换到全局锁列表，然后在深度遍历，当wait_for和当前THD相同时，形成环；然后递归返回时，通过权重确定victim。
 
 ````c++
-
 ctx::find_deadlock
     while (1) {
         Deadlock_detection_visitor dvisitor(this); // ctx
@@ -185,7 +185,7 @@ Deadlock_detection_visitor 是死锁检测中重要的辅助类，主要负责�
 
 {{< hint danger>}}
 
-DL锁并不是对表加锁，而是在加表锁前的一个预检查，如果能拿到MDL锁，下一步加相应的表锁。
+MDL锁并不是对表加锁，而是在加表锁前的一个预检查，如果能拿到MDL锁，下一步加相应的表锁。
 
 {{</hint>}}
 
@@ -315,37 +315,7 @@ type表示MDL锁的类型，enum_mdl_type
 | MDL_SHARED_NO_READ_WRITE  | SNRW |                            |
 | MDL_EXCLUSIVE             | X    |                            |
 
-
-
-\* MDL_INTENTION_EXCLUSIVE IX // 意向X锁，只用于scope 锁
-
-\* MDL_SHARED S // 只能读metadata，当能读写数据，如检查表是否存在时用这个锁
-
-\* MDL_SHARED_HIGH_PRIO SH // 高优先级S锁，可以抢占X锁，只能读metadata，不能读写数据，用于填充INFORMATION_SCHEMA，或者show create table时
-
-\* MDL_SHARED_READ SR // 可以读表数据，select语句，lock table xxx read 都用这个
-
-\* MDL_SHARED_WRITE SW // 可以更新表数据，insert，update，delete，lock table xxx write, select for update，
-
-\* MDL_SHARED_UPGRADABLE SU // 可升级锁，可以升级为SNW或者X锁，ALTER TABLE第一阶段会用到
-
-\* MDL_SHARED_NO_WRITE SNW // 可升级锁，其它线程能读metadata，数据可读不能读，持锁者可以读写，可以升级成X锁，ALTER TABLE的第一阶段
-
-\* MDL_SHARED_NO_READ_WRITE SNRW // 可升级锁，其它线程能读metadata，数据不能读写，持锁者可以读写，可以升级成X锁，LOCK TABLES xxx WRITE
-
-\* MDL_EXCLUSIVE X // 排它锁，禁止其它线程的所有请求，CREATE/DROP/RENAME TABLE
-
-- MDL_INTENTION_EXCLUSIVE(IX) 意向排他锁，锁定一个范围，用在GLOBAL/SCHEMA/COMMIT粒度。
-- MDL_SHARED(S) 用在只访问元数据信息，不访问数据。例如CREATE TABLE t LIKE t1;
-- MDL_SHARED_HIGH_PRIO(SH) 也是用于只访问元数据信息，但是优先级比排他锁高，用于访问information_schema的表。例如：select * from information_schema.tables;
-- MDL_SHARED_READ(SR) 访问表结构并且读表数据，例如：SELECT * FROM t1; LOCK TABLE t1 READ LOCAL;
-- MDL_SHARED_WRITE(SW) 访问表结构且写表数据， 例如：INSERT/DELETE/UPDATE t1 … ;SELECT * FROM t1 FOR UPDATE;LOCK TALE t1 WRITE
-- MDL_SHARED_WRITE_LOW_PRIO(SWLP) 优先级低于MDL_SHARED_READ_ONLY。语句INSER/DELETE/UPDATE LOW_PRIORITY t1 …; LOCK TABLE t1 WRITE LOW_PRIORITY。
-- MDL_SHARED_UPGRADABLE(SU) 可升级锁，允许并发update/read表数据。持有该锁可以同时读取表metadata和表数据，但不能修改数据。可以升级到SNW、SNR、X锁。用在alter table的第一阶段，使alter table的时候不阻塞DML，防止其他DDL。
-- MDL_SHARED_READ_ONLY(SRO) 持有该锁可读取表数据，同时阻塞所有表结构和表数据的修改操作，用于LOCK TABLE t1 READ。
-- MDL_SHARED_NO_WRITE(SNW) 持有该锁可以读取表metadata和表数据，同时阻塞所有的表数据修改操作，允许读。可以升级到X锁。用在ALTER TABLE第一阶段，拷贝原始表数据到新表，允许读但不允许更新。
-- MDL_SHARED_NO_READ_WRITE(SNRW) 可升级锁，允许其他连接读取表结构但不可以读取数据，阻塞所有表数据的读写操作，允许INFORMATION_SCHEMA访问和SHOW语句。持有该锁的的连接可以读取表结构，修改和读取表数据。可升级为X锁。使用在LOCK TABLE WRITE语句。
-- MDL_EXCLUSIVE(X) 排他锁，持有该锁连接可以修改表结构和表数据，使用在CREATE/DROP/RENAME/ALTER TABLE 语句。
+略
 
 duration表示MDL锁的持有时长，enum_mdl_duration
 
@@ -540,48 +510,6 @@ visit_subgraph                              和死锁检测相关
 acquire_locks：一次性申请多个X锁，要么全部成功要么全部失败，用于RENAME, DROP和其他DDL语句
 如果后续的锁grant失败，会通过savepoint将前面已经申请到的锁也rollback。
 
-比如drop table test.t1这个DDL会一次加3个锁：
-
-1. GLOBAL，MDL_INTENTION_EXCLUSIVE
-2. test 库, MDL_INTENTION_EXCLUSIVE
-3. test.t1 表，MDL_EXCLUSIVE
-
-MDL_context::acquire_lock
-
-主加锁函数，调试MDL锁相关问题时，给这个函数加断点比较有效。先调用MDL_context::try_acquire_lock_impl，如果加锁失败就进入等待加锁逻辑：
-
-1. 将MDL_context::try_acquire_lock_impl返回的ticket放进MDL_lock的等待队列
-2. 触发一次死锁检测
-3. 进入等待，等待又分为2种：
-   1. 定时检查等待: 如果当前请求的锁是比较高级的（对于MDL_object_lock是比MDL_SHARED_NO_WRITE类型更高，对于MDL_scoped_lock是MDL_SHARED类型），就会每秒给其它持有当前锁的线程（并且这些连接持有的锁等级比较低）发信号，通知其释放锁，然后再检查是否锁已拿到
-   2. 一直等待，直到超时
-4. 检查步骤3的等待结果，可以是GRANTED（拿到锁）、VICTIM（被死锁检测算法选为受害者）、TIMEOUT（加锁超时）、KILLED（连接被kill）。拿到锁返回成功，其它返回失败
-
-MDL_context::upgrade_shared_lock
-
-锁升级，从共享锁升级到互斥锁，实现方式是重新申请一个目标锁，拿到新的ticket后替换老的ticket，用在alter table和create table场景中。
-
-如create table test.t1(id int) engine = innodb，会先拿test.t1的MDL_SHARED共享锁，检查表是否存在，如果不存在就把锁升级到MDL_EXCLUSIVE锁，然后开始建表。
-
-对于alter table test.t1 add column name varchar(10), algorithm=copy;，alter用copy到临时的方式来做。整个过程中MDL顺序是这样的：
-
-1. 刚开始打开表的时候，用的是 MDL_SHARED_UPGRADABLE 锁；
-2. 拷贝到临时表过程中，需要升级到 MDL_SHARED_NO_WRITE 锁，这个时候其它连接可以读，不能更新；
-3. 拷贝完在交换表的时候，需要升级到是MDL_EXCLUSIVE，这个时候是禁止读写的。
-
-所以在用copy算法alter表过程中，会有2次锁升级。
-
-MDL_ticket::downgrade_lock 和MDL_context::upgrade_shared_lock对应的锁降级，从互斥锁降级到共享锁，实现比较简单，直接把锁类型改为目标类型（不用重新申请）。
-
-对于alter table test.t1 add column name varchar(10), algorithm=inplace，如果alter使用inplace算法的话，整个过程中MDL加锁顺序是这样的：
-
-1. 和copy算法一样，刚开始打开表的时候，用的是 MDL_SHARED_UPGRADABLE 锁；
-2. 在prepare前，升级到MDL_EXCLUSIVE锁；
-3. 在prepare后，降级到MDL_SHARED_UPGRADABLE（其它线程可以读写）或者MDL_SHARED_NO_WRITE（其它线程只能读不能写），降级到哪种由表的引擎决定；
-4. 在alter结束后，commit前，升级到MDL_EXCLUSIVE锁，然后commit。
-
-可以看到inplace有2次锁升级，1次降级，不过在alter最耗时的阶段是有可能降级到MDL_SHARED_UPGRADABLE的，对其它线程的影响小。
-
 ### MDL_request
 
 MDL_request用于描述THD当前SQL的MDL锁请求语义（请求什么对象什么类型多长时间的MDL锁），负责THD → MDL的交互数据，由6元组组成：![MySQL_MDL_request](/MySQL_MDL_request.png)
@@ -744,6 +672,7 @@ MySQL为了获得全局一致性的点位，通过FTWRL（FLUSH TABLES WITH READ
 - COMMIT+S+EXPLICIT（通过Global_read_lock::make_global_read_lock_block_commit）
 
 并清空表缓存（逼迫更新表元信息必须先走open table获取GLOBAL+IX+STMT），以及其他元信息更新入口
+
 阻止元数据修改和表数据更改（S和IX不兼容）：
 
 - 更新表元信息必须先走open table获取GLOBAL+IX+STMT）
@@ -806,8 +735,3 @@ xa_transaction xa事务提交
     rollback                                            COMMIT+IX+STMT
 ````
 
-TODO:
-
-FAST PATH（unobtrusive） OR SLOW PATH（obtrusive）
-
-LF_HASH

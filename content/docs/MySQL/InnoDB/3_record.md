@@ -151,7 +151,7 @@ InnoDB在行的存储格式上进行过的优化：
 - 内存物理结构的一致
 - 事务语义的一致
 
-首先看一下内存物理结构的一致：在B+树中，access path是从树顶到叶子节点的，所以concurrency control只需要对B+树（index tree + index page）以及叶子节点（data page）进行latch并发控制（SMO & FIX）即可。对于存储在data page内部的行，无需关心latch并发控制。
+首先看一下内存物理结构的一致：在B+ tree中，access path是从树顶到叶子节点的，所以concurrency control只需要对B+ tree（index tree + index page）以及叶子节点（data page）进行latch并发控制（SMO & FIX）即可。对于存储在data page内部的行，无需关心latch并发控制。
 
 事务语义的一致，则是通过悲观（locking）或乐观（TSO、Multi-version）的方式保证的。在MySQL中，是通过MV2PL protocol的方式来实现的。MySQL为了控制锁资源，通过在锁对象内部的page bitmap的方式实现行锁以及type_mode实现谓词锁。
 
@@ -866,7 +866,7 @@ dtuple_convert_big_rec用于将逻辑记录转化为大记录的格式，当转�
 
 # 记录之间的比较
 
-InnoDB在通过B+树搜索时，通过B+树索引只能定位到记录所在的页，不能直接定位到具体的记录（行）。在找到页后，还需要通过二叉查找算法进行搜索，最终定位到查询的记录。因此，在查找时需要对记录进行比较。
+InnoDB在通过B+ tree搜索时，通过B+ tree索引只能定位到记录所在的页，不能直接定位到具体的记录（行）。在找到页后，还需要通过二叉查找算法进行搜索，最终定位到查询的记录。因此，在查找时需要对记录进行比较。
 
 记录的比较可以分为逻辑记录与物理记录之间的比较，以及物理记录之间的比较。通常来说，一般进行的都是逻辑记录和物理记录的比较，这是因为，对于插入操作，本身就不存在物理记录，所以需要构造一个逻辑记录，而对于UPDATE、DELETE操作，首先需要通过SELECT进行定位，这时就会转化为逻辑记录。
 

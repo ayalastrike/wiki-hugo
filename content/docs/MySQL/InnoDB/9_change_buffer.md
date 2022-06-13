@@ -4,7 +4,7 @@ typora-copy-images-to: ../../../../static
 title: change buffer
 ---
 
-change buffer是InnoDB所特有的，设计思想非常先进，首先详细介绍change buffer的设计机制和实现细节，然后介绍其为了避免死锁所做的考虑。
+change buffer是InnoDB所特有的。
 
 # 设计
 
