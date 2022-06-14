@@ -744,7 +744,7 @@ FIL_HEADER和FIL_TRAIL的字段如下：
 | FIL_PAGE_NEXT                    | 4                           | 后一个页的偏移量（仅对索引页有效）                           |                                                              |
 | FIL_PAGE_LSN                     | 8                           | 页LSN                                                        |                                                              |
 | FIL_PAGE_TYPE                    | 2                           | 页类型                                                       |                                                              |
-| FIL_PAGE_FILE_FLUSH_LSN          | 8                           | 仅在系统表空间的第1个页（0,0）中使用，用来判断数据库是否正常关闭 |                                                              |
+| FIL_PAGE_FILE_FLUSH_LSN          | 8                           | 仅在系统表空间的第1个页（0,0）中使用，用来判断数据库是否正常关闭，透明压缩页也会用作存储压缩信息 |                                                              |
 | FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID | 8                           | 表空间ID（缓冲池中靠space_id+page_no来标识页）               |                                                              |
 | FIL_PAGE_DATA_END（8）           | FIL_PAGE_END_LSN_OLD_CHKSUM | 8                                                            | 前4个字节存放checksum，后4个字节存放FIL_PAGE_LSN的后4个字节，用于检测页是否损坏 |
 
@@ -818,7 +818,7 @@ space header保存的元信息如下：
 | FSP_FREE_FRAG       | 16   | 碎片半满区链表，该链表中的区中的页要么属于不同的段，要么还未分配 |
 | FSP_FULL_FRAG       | 16   | 碎片全满区链表，当由page从该链表的区中释放时，则将该区移回碎片半满区链表 |
 | FSP_SEG_ID          | 8    | 下一个段的ID，在表空间中，每个段都有唯一的编号，即段ID，每次分配段后+1 |
-| FSP_SEG_INODES_FULL | 16   | 已经完全用满的segment inode页链表（也称为段inode全满页链表） |
+| FSP_SEG_INODES_FULL | 16   | 已经完全用满的segment inode页链表（也称为段inode全满页链表）（LEN 4 + FIRST 6 + LAST 6） |
 | FSP_SEG_INODES_FREE | 16   | 至少存在一个空闲的segment inode entry的segment inode页链表（也称为段inode未满页链表） |
 
 {{< hint info>}}
@@ -840,7 +840,7 @@ space header保存的元信息如下：
 | 字段           | 大小 | 说明                                                         |
 | :------------- | :--- | :----------------------------------------------------------- |
 | XDES_ID        | 8    | 如果区已分配给段，则记录其段ID（segment inode entry.FSEG_ID） |
-| XDES_FLST_NODE | 12   | 区所在的链表节点：FSP_FREE、FSP_FREE_FRAG / FSP_FULL_FRAG、或者位于某个B+树的segment inode entry链表中 |
+| XDES_FLST_NODE | 12   | 区所在的链表节点：FSP_FREE、FSP_FREE_FRAG / FSP_FULL_FRAG、或者位于某个B+ tree的segment inode entry链表中 |
 | XDES_STATE     | 4    | 区状态XDES_FREE     ：空闲区，待分配给段，在FSP_FREE链表中 XDES_FREE_FRAG：碎片半满区，在FSP_FREE_FRAG链表中 XDES_FULL_FRAG：碎片全满区，在FSP_FULL_FRAG链表中 XDES_SEG      ：已分配给段，记录段ID |
 | XDES_BITMAP    | 16   | 区中64个页的使用状态，用2个bit表示一个页 XDES_FREE_BIT  ：该页是否空闲 XDES_CLEAN_BIT：未使用，保留位 |
 
@@ -911,6 +911,12 @@ root页中的segment info描述了non leaf segment和leaf segment的segment head
 | PAGE_BTR_SEG_TOP  | 10 (FSEG_HEADER_SIZE) | non leaf segment在segment inode page中的位置 |
 
 当创建一个索引的时候，实际上就是在构建一个新的B+树（btr_create），先为non leaf segment分配一个segment inode entry（从FSP_SEG_INODES_FREE找到一个空闲的segment inode页，从中分配segment inode entry），然后创建root page（根节点页，其位于segment inode entry的第一个碎片页），并将该segment inode entry的位置信息更新到root page上；之后在分配leaf segment的segment inode entry，过程同上。
+
+表空间page分配的策略大致为：
+
+1. 新的segment，先使用碎片页，然后再从空闲区链表中申请segemnt
+2. 尽量物理连续（hint page）
+3. 尽量使用segment的未使用页（先从半满段取，再从空闲段取）
 
 ## 表空间
 

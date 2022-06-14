@@ -1026,7 +1026,7 @@ purge的执行序列通过构建SQL execution graph来实现。
 
 - 事务的提交序和执行序不一样，因此在purge undo和purge记录时有依赖关系，需要构建graph
 
-并且，在进行purge操作时，会产生大量的随机读，这可能会产生性能问题。另外，如果出现了长事务正在使用mvcc（比如最新的active事务），则会导致history链表最头部的已提交事务的undo log的回收无法进行。
+并且，在进行purge操作时，如果undo page在buffer pool还好，如果已经flush到磁盘，则会产生大量的随机读，这可能会产生性能问题。另外，如果出现了长事务正在使用mvcc（比如最新的active事务），则会导致history链表最头部的已提交事务的undo log的回收无法进行。
 
 ### purge实现
 
@@ -1086,13 +1086,13 @@ latch用于保证删除undo日志的正确性，保证删除时没有其他事�
 
 crash recovery的恢复分为两个阶段：
 
-1. forward，恢复到内存态，即将redo log从checkpoint到最新，进行apply，将磁盘上的数据恢复到crash时的内存态，其中也包括undo log。
+1. forward，恢复到内存态，即将redo log从checkpoint到最新，进行apply，将磁盘上的数据恢复到crash时的内存态，其中也包括undo log。这样就获得ongoing事务列表。
 
 2. backward：因为buffer pool的STEAL+NO-FORCE，需要将active STEAL的数据rollback掉，即找出active+prepared事务，将其rollback，也称为failure atomic。
 
    具体来讲，遍历所有rollback segment，读取其undo segment中的undo segment page中TRX_UNDO_STATE，可以得知其事务状态（还记得前面说过的吗，一个undo segment只会最多有一个active transaction），如果为活跃事务，则需要遍历该事务的undo来rollback，以及构建出事务子系统的内存布局：trx_sys，trx_t，trx_rseg_t和trx_undo_t
-
-这里还需要考虑XA事务。
+   
+   读取最后一个binlog文件，判断文件头是否有LOG_EVENT_BINLOG_IN_USE_F，有则意味着MySQL异常关闭，则依次读取binlog中的event，提取XID用于XA事务恢复
 
 总结一下，数据库系统整体的恢复节奏如下：
 

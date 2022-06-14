@@ -446,14 +446,20 @@ page 7
 
 ## secondary index
 
-辅助索引的非叶子节点存储的是记录格式为<index_key，primary_key，page_no>，这里注意辅助索引的非叶子节点存放了主键值信息。另外，辅助索引节点的记录不保存系统列 trx_id和rollback point。
+辅助索引的非叶子节点存储的是记录格式为<index_key，primary_key，page_no>，这里注意辅助索引的非叶子节点存放了主键值信息。另外，辅助索引节点的记录不保存系统列 trx_id和rollback pointer。
+
+{{< hint info>}}
+
+如果index_key和primary_key有重合，则只保留一份，比如 index_key(B, C), primary_key(A, B)，则record为(B,C,A)
+
+{{</hint>}}
 
 {{< hint danger>}}
 
 这里给读者留2个问题：
 
 1. 为什么非叶子节点的记录中要包含primary key？
-2. 辅助索引记录不包吃trx id和rollback point，那么MVCC正常吗？
+2. 辅助索引记录不包括trx id和rollback pointer，那么MVCC正常吗？
 
 {{</hint>}}
 

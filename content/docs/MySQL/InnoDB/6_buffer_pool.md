@@ -1386,6 +1386,89 @@ Each reader thread owns a single-writer/multi-reader shared pointer called "**ha
 
 doublewrite segment的管理在事务一章讲述。
 
+# 压缩页的管理
+
+## compressed page
+
+InnoDB支持两种compressed page：
+
+- transparent page compression
+- row compression
+
+### transparent page compression
+
+MySQL 5.7新增的（page type = FIL_PAGE_COMPRESSED），利用内核Punch hole特性，对于一个index page，对page body进行压缩，压缩后剩余的地方"打洞"，即在磁盘上不占用实际空间（只在元信息中记录），比传统的lz4 compression具有更好的压缩比，实现也更简单。在buffer pool中是一个正常的page，只有在读写磁盘时，才进行压缩、解压，这也是其“透明”的意思。
+
+FIL_PAGE_FILE_FLUSH_LSN开始的8个字节记录压缩信息：
+
+| 名称                      | 大小 | 说明                                |
+| ------------------------- | ---- | ----------------------------------- |
+| FIL_PAGE_VERSION          | 1    | version                             |
+| FIL_PAGE_ALGORITHM_V1     | 1    | 压缩算法                            |
+| FIL_PAGE_ORIGINAL_TYPE_V1 | 2    | 压缩前的page type，解压后要还原回去 |
+| FIL_PAGE_ORIGINAL_SIZE_V1 | 2    | 压缩前page body的大小               |
+| FIL_PAGE_COMPRESS_SIZE_V1 | 2    | 压缩后的大小                        |
+
+punch hone后的page要和磁盘的block对齐（整数倍）。
+
+如下图所示：
+
+![InnoDB_buffer_pool_transparent_page_compression](/InnoDB_buffer_pool_transparent_page_compression.png)
+
+通过create table或者alter table来开启：
+
+~~~~
+CREATE TABLE test (
+    a int,
+    b varchar(2000)
+) compression='zlib';
+~~~~
+
+目前压缩算法支持zlib和lz4。
+
+压缩过程：
+
+1. 在buffer pool中压缩数据，对齐磁盘block
+2. 将压缩页写入文件
+3. 调用os_file_io_complete，执行punch hole（os_file_punch_hole）
+
+解压过程：
+
+读取过程和压缩反序。
+
+另外，Facebook的大神Domas写了一篇[博客](http://dom.as/2015/04/09/how-innodb-lost-its-advantage/)，认为InnoDB推出这样的压缩特性，使其正在丧失自身的优势，非常值得一读。简单的摘要下：
+
+- 无法完美压缩：例如9KB的数据可能需要12kb来存储，取决于block size；
+- 无法压缩Buffer pool, 这是和传统innodb压缩相比，以前的压缩方式可以在内存中只存放压缩页拷贝 （然而也有可能同时存在压缩和解压页），因此用户可能需要去购买iops更高的设备，而oracle正好也卖这些….
+- punch hole 可能产生的文件碎片化，底层的文件管理更加复杂；
+- 对innodb文件做punch hole可能带来的后果是，使得每个文件的page变成一个独立的segment，文件系统需要单独的journal和metadata来管理。另外也有可能有性能问题：可能比non-sparse的写操作昂贵五倍 （这依赖于具体的内核）；
+- 删除一个拥有几百万个段管理对象的数据文件带来的开销会非常昂贵。
+
+### row compression
+
+create table或者alter table时指定row_format=compressed key_block_size=1|2|4|8，ibd文件以对应的block size进行划分。
+
+在buffer pool中存在两份数据：压缩页（ZIP_PAGE）和解压页（FILE_PAGE）。修改后的解压页转变为ZIP_DIRTY，并将DML操作以特殊格式记入压缩页中的mlog（Modification  Log）：
+
+- insert：写入完整记录
+- update：
+  - delete-insert update：旧记录的dense slot标记删除，写入完整记录
+  - in-place update：写入新更新的记录
+- delete：dense slot标记删除
+
+compressed page格式如下：
+
+| 字段                      | 说明                                                         |
+| ------------------------- | ------------------------------------------------------------ |
+| FIL_PAGE_HEADER           | 不处理                                                       |
+| Index Filed Information   | 索引的列信息，在crash recovery时可恢复出索引信息             |
+| Compressed Data           | 压缩数据，按照heap no进行压缩，不压缩系统列和extern列指针    |
+| Free Space                | 空闲空间                                                     |
+| External_Ptr（optional）  | extern列指针数组，只存在聚集索引叶子节点，每个数组元素占20个字节(BTR_EXTERN_FIELD_REF_SIZE) |
+| 系统列（trxid, roll_ptr） | 只存在于聚集索引叶子节点，数组元素和其heap no一一对应        |
+| node ptr                  | 只存在于索引非叶子节点，存储节点指针数组                     |
+| Dense Page Directory      | 分两部分，第一部分是有效记录，记录其在解压页中的偏移位置，n_owned和delete标记信息，按照键值顺序；第二部分是空闲记录；每个slot占两个字节。 |
+
 # MySQL 8.0改进
 
 MySQL在宕机时，会生成巨大的core文件。在MySQL 8.0.14中，引入了[innodb_buffer_pool_in_core_file](https://dev.mysql.com/doc/refman/8.0/en/innodb-parameters.html#sysvar_innodb_buffer_pool_in_core_file)在core文件中剔除缓冲池页面，极大的缩小了core文件的大小。（需要linux kernel 3.4以上，支持MADV_DONTDUMP non-POSIX extension to madvise()）

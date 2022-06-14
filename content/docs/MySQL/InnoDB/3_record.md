@@ -710,7 +710,9 @@ rec_convert_dtuple_to_rec_comp(
 
 ## 大记录格式
 
-如果列过大，一个数据页会存储不下，这样的记录称之为大记录（big record），大列存储的页称为溢出页（overflow page），列称为off-page columns。对于InnoDB来说，只有类型为BLOB和TEXT才可能是off-page column。如果实际的列值少于1000字节，则放在当前页，否则才采用溢出页存储（多个溢出页组成单向链表）。
+### blob page
+
+如果列过大，一个数据页会存储不下，这样的记录称之为大记录（big record），大列存储的页称为溢出页（overflow page）（page type=FIL_PAGE_TYPE_BLOB），列称为off-page columns。对于InnoDB来说，只有类型为BLOB和TEXT才可能是off-page column。如果实际的列值少于1000字节，则放在当前页，否则才采用溢出页存储（多个溢出页组成单向链表）。
 
 {{< hint danger>}}
 
@@ -813,6 +815,12 @@ ff ff ff ff                 // BTR_BLOB_HDR_NEXT_PAGE_NO
 由于仅用1个off-page就可以存下第4列的溢出数据，因此这里BTR_BLOB_HDR_PART_LEN = 之前BTR_EXTERN_LEN的值，即9873，并且BTR_BLOB_HDR_NEXT_PAGE_NO的值为0xffffffff（EOF）。
 
 大记录对InnoDB的性能会产生影响，例如对于更新、删除操作，其只能进行悲观操作，而这意味着并发性能的下降。这部分在B+树的章节中进行具体的介绍。总之，除非必要，尽量使得表中的记录紧凑，同时尽可能的符合数据库理论的范式要求。
+
+### compressed blob page
+
+压缩的over-flow page。第一个用FIL_PAGE_TYPE_ZBLOB标识，后续page用FIL_PAGE_TYPE_ZBLOB2标识。
+
+多个zblob page用链表串联。
 
 ## 伪记录
 
