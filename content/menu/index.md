@@ -26,6 +26,7 @@ headless: false
         - [read_only]({{< relref "/docs/MySQL/Server/read_only.md" >}})
         - [lower_case_table_names]({{< relref "/docs/MySQL/Server/lower_case_table_names.md" >}})
         - [Invisible Index]({{< relref "/docs/MySQL/Server/invisible_index.md" >}})
+        - [lazy drop/truncate table]({{< relref "/docs/MySQL/Server/lazy_drop_table.md" >}})
     - [InnoDB]({{< relref "/docs/MySQL/InnoDB" >}})
         - [overview]({{< relref "/docs/MySQL/InnoDB/1_overview.md" >}})
         - [source code]({{< relref "/docs/MySQL/InnoDB/2_source.md" >}})

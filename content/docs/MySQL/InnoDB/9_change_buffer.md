@@ -60,8 +60,8 @@ change buffer tree虽然也是一个B+ tree，但是其和之前的index tree有
 
 1. change buffer tree全局只有一颗，类型为DICT_CLUSTERED | DICT_IBUF，index_id = 0xFFFFFFFF00000000ULL
 2. change buffer tree的index root page是固定的，位于系统表空间的（0, 4）位置
-3. 空闲页通过链表管理，链表在index root page（PAGE_BTR_IBUF_FREE_LIST），复用了原来的leaf segment header（PAGE_BTR_SEG_LEAF），空闲页的页类型为FIL_PAGE_IBUF_FREE_LIST，空闲页通过链表节点串联前后位置（PAGE_BTR_IBUF_FREE_LIST_NODE），也复用了原来的leaf segment header
-4. 因为#3复用了leaf segment header，所以用一个特殊的change buffer header page（0, 3）用于change buffer tree page的管理，其segment entry位于IBUF_TREE_SEG_HEADER（PAGE_BTR_SEG_LEAF PAGE_DATA + 0：38 + 0）
+3. 空闲页通过链表管理，链表在index root page（PAGE_BTR_IBUF_FREE_LIST），复用了原来的leaf segment header（PAGE_BTR_SEG_LEAF），空闲页链表中的空闲页的页类型为FIL_PAGE_IBUF_FREE_LIST，空闲页通过链表节点串联前后位置（PAGE_BTR_IBUF_FREE_LIST_NODE），也复用了原来的leaf segment header
+4. 因为#3复用了leaf segment header，所以用一个特殊的change buffer header page（0, 3）用于change buffer tree page的管理，即段管理，其segment entry位于IBUF_TREE_SEG_HEADER
 
 ## change buffer record
 
@@ -108,7 +108,7 @@ change buffer bitmap中保存的针对每个页的bitmap中位信息如下：
 | :------------------- | :----- | :----------------------------------------------------------- |
 | IBUF_BITMAP_FREE     | 2      | 记录UNSI leaf page的剩余空间                                 |
 | IBUF_BITMAP_BUFFERED | 1      | 该页是否已被chagne buffer cache，用于物理读NUSI leaf page后判断是否需要merge |
-| IBUF_BITMAP_IBUF     | 1      | 该页是否为change buffer page，<font color=red>主要用于异步IO（ibuf_thread）的读操作（ibuf_page_low）</font> |
+| IBUF_BITMAP_IBUF     | 1      | 该页是否为change buffer page，主要用于异步change buffer thread IO（ibuf_thread）的读操作（ibuf_page_low） |
 
 其中IBUF_BITMAP_FREE表示的剩余空间含义为：
 

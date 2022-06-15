@@ -81,6 +81,10 @@ trx_sys page:
 
 {{</hint>}}
 
+整体上系统表空间中页的分布如下：
+
+![InnoDB_trx_sys_tablespace](/InnoDB_trx_sys_tablespace.png)
+
 ## trx_sys page
 
 事务系统段在InnoDB第一次启动时创建（trx_sysf_create），trx_sys segment header保存在系統表空間的(0, 5)位置，该页称为trx_sys page，保存以下事务信息：
