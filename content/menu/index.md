@@ -42,3 +42,4 @@ headless: false
         - [redo log]({{< relref "/docs/MySQL/InnoDB/11_redo_log.md" >}})
         - [transaction]({{< relref "/docs/MySQL/InnoDB/12_transaction.md" >}})
     - [Replication]({{< relref "/docs/MySQL/Replication" >}})
+        - [MGR增加seconds_behind_master]({{< relref "/docs/MySQL/Replication/MGR_seconds_behind_master.md" >}})
